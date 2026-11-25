@@ -139,6 +139,11 @@ class MockPrinter:
         self._running = False
         if self._sock:
             try:
+                # Linux keeps a closed socket listening while accept() blocks on it: shut it down first.
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 self._sock.close()
             except OSError:
                 pass
