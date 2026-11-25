@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+e2e-output/
+mock-prints/
+.DS_Store

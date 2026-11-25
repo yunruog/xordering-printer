@@ -1,0 +1,2 @@
+# Runtime: Python 3.9+ standard library (tkinter, sqlite3, urllib) plus Pillow for image mode.
+Pillow>=10
