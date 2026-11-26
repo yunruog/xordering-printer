@@ -5,7 +5,7 @@ the server details come from the XOrdering site's printer-config.json, and the d
 printers are stored on this computer only (see paths.py).
 """
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 APP_NAME = "XOrderingPrinter"
 APP_TITLE = "XOrdering 打印 Printer"
 # Public, no sign-in: where updates come from.

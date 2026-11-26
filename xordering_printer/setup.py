@@ -5,12 +5,13 @@ Connecting gives the computer a device token, by either
   * the owner's phone sign-in (the dashboard's SMS code): the session is used once to register
     this computer for the chosen restaurant, then signed out. Only the device token is kept.
 """
+import re
 import socket
 from typing import Any, Dict, List, Optional
 
-from . import api, config, escpos, ticket
+from . import api, config, escpos, render, ticket
 from .logs import get as get_log
-from .printer import send
+from .printer import probe, scan, send
 
 
 def computer_name() -> str:
@@ -40,8 +41,14 @@ def _store_device(result: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def clean_key(text: str) -> str:
+    """The device key out of whatever was pasted (a whole message, a link, extra spaces)."""
+    m = re.search(r"xpk_[0-9a-fA-F]{32}", text or "")
+    return m.group(0) if m else (text or "").strip()
+
+
 def pair_with_key(key: str, name: Optional[str] = None) -> Dict[str, Any]:
-    return _store_device(_client().pair(key, name or computer_name()))
+    return _store_device(_client().pair(clean_key(key), name or computer_name()))
 
 
 def normalize_phone(country: str, number: str) -> str:
@@ -93,9 +100,43 @@ def save_printer(printer: Dict[str, Any]) -> Dict[str, Any]:
     return saved
 
 
+def _kind(printer: Dict[str, Any]) -> str:
+    return "star" if escpos.kind(printer) == "star" else "escpos"
+
+
 def test_print(printer: Dict[str, Any]) -> None:
-    """Prints the test ticket straight to the printer (raises PrinterError when it can't)."""
+    """Prints the test page (the sample order, ASAP and scheduled) straight to the printer."""
     cfg = config.load()
-    lines = ticket.test_lines(printer, cfg.get("restaurant"))
-    send(printer["host"], int(printer.get("port") or 9100), escpos.ticket_bytes(lines, printer))
-    get_log().info("test print sent to %s (%s)", printer.get("name"), printer.get("host"))
+    payload = escpos.tickets_bytes(ticket.test_tickets(cfg.get("restaurant")), printer)
+    send(printer["host"], int(printer.get("port") or 9100), payload, kind=_kind(printer))
+    get_log().info("test page sent to %s (%s)", printer.get("name"), printer.get("host"))
+
+
+def test_connection(host: str, port: int = 9100, render_kind: str = "text") -> Dict[str, Any]:
+    """Connects to the printer without printing: {ok, ms, status} or raises PrinterError (timeout, refused, …)."""
+    return probe(host.strip(), int(port or 9100), kind="star" if render_kind == "star" else "escpos")
+
+
+def find_printers(port: int = 9100) -> List[str]:
+    """Devices on this computer's network(s) with the printer port open."""
+    found = scan(port)
+    get_log().info("printer scan found %s", ", ".join(found) or "nothing")
+    return found
+
+
+def preview_file() -> str:
+    """The sample tickets as one PNG next to the logs (what the printer gets), for the window's preview."""
+    from PIL import Image
+
+    from .paths import log_dir
+
+    imgs = render.render_many(ticket.test_tickets(config.load().get("restaurant")), 80)
+    gap = 24
+    sheet = Image.new("1", (sum(i.size[0] for i in imgs) + gap * (len(imgs) - 1), max(i.size[1] for i in imgs)), 1)
+    x = 0
+    for img in imgs:
+        sheet.paste(img, (x, 0))
+        x += img.size[0] + gap
+    path = log_dir().parent / "preview.png"
+    sheet.save(path)
+    return str(path)

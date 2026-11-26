@@ -26,7 +26,15 @@ class GuiTest(unittest.TestCase):
             root.update()
             self.assertEqual(app.view, "status")
             self.assertEqual(len(app.tree.get_children()), 1)
-            gui.PrinterDialog(app, config.load()["printers"][0]).top.destroy()
+            d = gui.PrinterDialog(app, config.load()["printers"][0])
+            root.update()
+            self.assertFalse(any(b.instate(["disabled"]) for b in d.paper_buttons))
+            d.render.set("star")
+            d.sync_paper()
+            self.assertEqual(d.paper.get(), "80")
+            self.assertTrue(all(b.instate(["disabled"]) for b in d.paper_buttons))
+            d.top.destroy()
+            self.assertTrue(hasattr(app, "conn_btn") and hasattr(app, "preview_btn"))
         finally:
             root.destroy()
 

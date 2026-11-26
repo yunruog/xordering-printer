@@ -119,15 +119,28 @@ class App:
 
         key_tab = ttk.Frame(tabs, padding=14)
         tabs.add(key_tab, text="设备密钥 Device key")
+        ttk.Label(key_tab, wraplength=520, text="在后台 设置 → 后厨打印机 → “生成设备密钥”，复制（或用手机扫码）后粘贴到下面。\nOn the dashboard: Settings → Kitchen printers → Create device key. Copy it (or scan its QR code with a phone) and paste it below.").pack(anchor="w", pady=(0, 8))
         ttk.Label(key_tab, text="设备密钥 Device key (xpk_…)").pack(anchor="w")
         key = ttk.Entry(key_tab, width=48)
         key.pack(fill="x", pady=(4, 10))
-        btn = ttk.Button(key_tab, text="连接 Connect")
-        btn.configure(command=lambda: self.bg(lambda: setup.pair_with_key(key.get().strip()), lambda _: self.connected(), btn) if key.get().strip() else None)
-        btn.pack(anchor="w")
+        row_k = ttk.Frame(key_tab)
+        row_k.pack(anchor="w")
+
+        def paste() -> None:
+            try:
+                text = self.root.clipboard_get()
+            except tk.TclError:
+                text = ""
+            key.delete(0, "end")
+            key.insert(0, setup.clean_key(text))
+
+        ttk.Button(row_k, text="粘贴 Paste", command=paste).pack(side="left")
+        btn = ttk.Button(row_k, text="连接 Connect")
+        btn.configure(command=lambda: self.bg(lambda: setup.pair_with_key(key.get()), lambda _: self.connected(), btn) if key.get().strip() else None)
+        btn.pack(side="left", padx=6)
 
         phone_tab = ttk.Frame(tabs, padding=14)
-        tabs.add(phone_tab, text="手机号登录 Phone sign-in")
+        tabs.add(phone_tab, text="手机号登录 Phone sign-in (SMS)")
         row = ttk.Frame(phone_tab)
         row.pack(fill="x")
         ttk.Label(row, text="国家/地区码 Code").grid(row=0, column=0, sticky="w")
@@ -206,8 +219,9 @@ class App:
         box = ttk.LabelFrame(self.body, text=" 打印机 Printers ", padding=10)
         box.pack(fill="both", expand=True, pady=(14, 8))
         cols = ("name", "host", "paper", "mode", "state")
+        self.status_cols = cols
         self.tree = ttk.Treeview(box, columns=cols, show="headings", height=6, selectmode="browse")
-        for c, title, w in zip(cols, ("名称 Name", "IP 地址 Address", "纸宽 Paper", "中文 Chinese", "状态 Status"), (120, 140, 70, 80, 140)):
+        for c, title, w in zip(cols, ("名称 Name", "IP 地址 Address", "纸宽 Paper", "类型 Type", "状态 Status"), (110, 130, 60, 110, 150)):
             self.tree.heading(c, text=title)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="both", expand=True)
@@ -216,9 +230,15 @@ class App:
         buttons.pack(fill="x", pady=(8, 0))
         ttk.Button(buttons, text="添加 Add", command=lambda: self.edit_printer(new=True)).pack(side="left")
         ttk.Button(buttons, text="修改 Edit", command=self.edit_printer).pack(side="left", padx=6)
-        self.test_btn = ttk.Button(buttons, text="测试打印 Test print", command=self.test_print)
-        self.test_btn.pack(side="left")
-        ttk.Label(box, wraplength=520, foreground="#555", text="两台打印机都会打印完整订单。IP 地址在打印机自检页上（多数机型：按住 FEED 键开机）。\nEach printer prints the whole order. The IP address is on the printer's self-test page (most models: hold FEED while switching on).").pack(anchor="w", pady=(8, 0))
+        self.conn_btn = ttk.Button(buttons, text="测试连接 Test connection", command=self.test_connection)
+        self.conn_btn.pack(side="left")
+        self.test_btn = ttk.Button(buttons, text="打印测试页 Test page", command=self.test_print)
+        self.test_btn.pack(side="left", padx=6)
+        self.preview_btn = ttk.Button(buttons, text="预览小票 Preview", command=self.preview)
+        self.preview_btn.pack(side="left")
+        self.conn_label = tk.Label(box, text="", anchor="w", justify="left", wraplength=520)
+        self.conn_label.pack(anchor="w", pady=(6, 0))
+        ttk.Label(box, wraplength=520, foreground="#555", text="每台开启的打印机都会打印完整订单。IP 地址在打印机自检页上（多数机型：按住 FEED 键开机）。建议在路由器上给打印机设固定 IP（DHCP 保留），以免 IP 变了打不出来。\nEach enabled printer prints the whole order. The IP address is on the printer's self-test page (hold FEED while switching on). Give the printer a fixed IP on the router (DHCP reservation) so it doesn't change.").pack(anchor="w", pady=(8, 0))
 
         foot = ttk.Frame(self.body)
         foot.pack(fill="x", pady=(6, 0))
@@ -259,7 +279,9 @@ class App:
         for p in cfg.get("printers") or []:
             ps = printer_state.get(p["id"]) or {}
             s = "已关闭 Off" if not p.get("enabled", True) else "● 正常 OK" if ps.get("ok") else f"● {ps.get('error')}" if ps.get("error") else "—"
-            self.tree.insert("", "end", iid=p["id"], values=(p.get("name"), f"{p.get('host')}:{p.get('port', 9100)}", f"{p.get('paperWidth', 80)} mm", "图片 Picture" if p.get("render") == "image" else "文字 Text", s))
+            if ps.get("ok") and ps.get("paperLow"):
+                s = "● 纸快用完 Paper low"
+            self.tree.insert("", "end", iid=p["id"], values=(p.get("name"), f"{p.get('host')}:{p.get('port', 9100)}", f"{80 if p.get('render') == 'star' else p.get('paperWidth', 80)} mm", MODES.get(p.get("render") or "text", ""), s))
         for iid in selected:
             if self.tree.exists(iid):
                 self.tree.selection_set(iid)
@@ -275,7 +297,7 @@ class App:
         printer = None if new else self.selected_printer()
         if printer is None:
             n = len(cfg.get("printers") or []) + 1
-            printer = {"name": f"后厨 Kitchen {n}", "host": "", "port": 9100, "paperWidth": 80, "render": "text", "enabled": True}
+            printer = {"name": f"后厨 Kitchen {n}", "host": "", "port": 9100, "paperWidth": 80, "render": "star", "enabled": True}
         PrinterDialog(self, printer)
 
     def test_print(self) -> None:
@@ -283,7 +305,24 @@ class App:
         if not p:
             messagebox.showinfo(APP_TITLE, "请先选择或添加打印机。Select or add a printer first.", parent=self.root)
             return
-        self.bg(lambda: setup.test_print(p), lambda _: messagebox.showinfo(APP_TITLE, f"已发送测试页到 {p['name']}。\nTest page sent to {p['name']}.\n\n中文是乱码？把这台打印机的“中文”改成“图片”。\nGarbled Chinese? Set this printer's Chinese to Picture.", parent=self.root), self.test_btn)
+        self.bg(lambda: setup.test_print(p), lambda _: messagebox.showinfo(APP_TITLE, f"已发送测试页到 {p['name']}（两张：普通单和预约单）。\nTest page sent to {p['name']} (two tickets: ASAP and scheduled).\n\n打不出来？Star TSP100 系列请选“Star 光栅”；中文乱码请选“图片”。\nNothing printed? Star TSP100: choose Star raster. Garbled Chinese: choose Picture.", parent=self.root), self.test_btn)
+
+    def test_connection(self) -> None:
+        p = self.selected_printer()
+        if not p:
+            messagebox.showinfo(APP_TITLE, "请先选择或添加打印机。Select or add a printer first.", parent=self.root)
+            return
+        self.conn_label.configure(text="正在连接 Connecting…", fg="#555")
+        run_probe(self, p.get("host", ""), p.get("port", 9100), p.get("render", "text"), self.conn_label, self.conn_btn)
+
+    def preview(self) -> None:
+        def opened(path: str) -> None:
+            if IS_WINDOWS:
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+
+        self.bg(setup.preview_file, opened, self.preview_btn)
 
     def open_logs(self) -> None:
         path = str(log_dir())
@@ -311,25 +350,80 @@ class PrinterDialog:
         self.name = self._entry(f, "名称 Name", printer.get("name", ""), 0)
         self.host = self._entry(f, "IP 地址 IP address (192.168.x.x)", printer.get("host", ""), 2)
         self.port = self._entry(f, "端口 Port", str(printer.get("port", 9100)), 4)
-        self.paper = tk.StringVar(value=str(printer.get("paperWidth", 80)))
-        ttk.Label(f, text="纸宽 Paper width").grid(row=6, column=0, sticky="w", pady=(8, 0))
-        pr = ttk.Frame(f)
-        pr.grid(row=7, column=0, sticky="w")
-        for v in ("80", "58"):
-            ttk.Radiobutton(pr, text=f"{v} mm", value=v, variable=self.paper).pack(side="left", padx=(0, 10))
-        self.render = tk.StringVar(value=printer.get("render", "text"))
-        ttk.Label(f, text="中文打印方式 Chinese text").grid(row=8, column=0, sticky="w", pady=(8, 0))
+        tools = ttk.Frame(f)
+        tools.grid(row=3, column=1, sticky="nw", padx=(8, 0))
+        self.scan_btn = ttk.Button(tools, text="扫描打印机 Scan", command=self.scan)
+        self.scan_btn.pack(side="left")
+        self.probe_btn = ttk.Button(tools, text="测试连接 Test connection", command=self.probe)
+        self.probe_btn.pack(side="left", padx=(6, 0))
+        self.found = tk.Listbox(f, height=4)
+        self.found.grid(row=4, column=1, rowspan=7, sticky="nwe", padx=(8, 0), pady=(6, 0))
+        self.found.bind("<<ListboxSelect>>", self.pick_found)
+        self.result = tk.Label(f, text="建议在路由器上给打印机设固定 IP。\nTip: give the printer a fixed IP on the router.", anchor="w", justify="left", fg="#555", wraplength=260)
+        self.result.grid(row=11, column=1, sticky="nw", padx=(8, 0), pady=(6, 0))
+        self.render = tk.StringVar(value=printer.get("render", "star"))
+        ttk.Label(f, text="打印机类型 Printer type").grid(row=6, column=0, sticky="w", pady=(8, 0))
         rr = ttk.Frame(f)
-        rr.grid(row=9, column=0, sticky="w")
-        ttk.Radiobutton(rr, text="文字 Text (GBK)", value="text", variable=self.render).pack(side="left", padx=(0, 10))
-        ttk.Radiobutton(rr, text="图片 Picture", value="image", variable=self.render).pack(side="left")
+        rr.grid(row=7, column=0, sticky="w")
+        for value, label in (("star", "Star 光栅 (TSP100III / TSP143)"), ("image", "ESC/POS 图片 Picture"), ("text", "ESC/POS 文字 Text (GBK)")):
+            ttk.Radiobutton(rr, text=label, value=value, variable=self.render, command=self.sync_paper).pack(anchor="w")
+        self.paper = tk.StringVar(value=str(printer.get("paperWidth", 80)))
+        ttk.Label(f, text="纸宽 Paper width").grid(row=8, column=0, sticky="w", pady=(8, 0))
+        pr = ttk.Frame(f)
+        pr.grid(row=9, column=0, sticky="w")
+        self.paper_buttons = [ttk.Radiobutton(pr, text=f"{v} mm", value=v, variable=self.paper) for v in ("80", "58")]
+        for btn in self.paper_buttons:
+            btn.pack(side="left", padx=(0, 10))
+        self.sync_paper()
         self.enabled = tk.BooleanVar(value=bool(printer.get("enabled", True)))
         ttk.Checkbutton(f, text="打印新订单 Print new orders", variable=self.enabled).grid(row=10, column=0, sticky="w", pady=(10, 0))
         b = ttk.Frame(f)
-        b.grid(row=11, column=0, sticky="we", pady=(16, 0))
+        b.grid(row=12, column=0, columnspan=2, sticky="we", pady=(16, 0))
         self.save_btn = ttk.Button(b, text="保存 Save", command=self.save)
         self.save_btn.pack(side="left")
         ttk.Button(b, text="取消 Cancel", command=top.destroy).pack(side="left", padx=6)
+
+    def sync_paper(self) -> None:
+        star = self.render.get() == "star"
+        if star:
+            self.paper.set("80")
+        for btn in self.paper_buttons:
+            btn.state(["disabled"] if star else ["!disabled"])
+
+    def scan(self) -> None:
+        self.found.delete(0, "end")
+        self.found.insert("end", "正在扫描 Scanning…")
+        self.result.configure(text="正在扫描局域网（约 10 秒）Scanning the network (about 10 s)…", fg="#555")
+
+        def done(ips: List[str]) -> None:
+            self.found.delete(0, "end")
+            for ip in ips:
+                self.found.insert("end", ip)
+            if ips:
+                self.result.configure(text=f"找到 {len(ips)} 台，点选一个填入 Found {len(ips)}: click one to use it", fg="#1b7f3b")
+            else:
+                self.result.configure(text="没找到开放 9100 端口的设备。打印机开机并插好网线了吗？\nNothing with port 9100 open. Is the printer on and cabled?", fg="#b3261e")
+
+        try:
+            port = int(self.port.get().strip() or "9100")
+        except ValueError:
+            port = 9100
+        self.app.bg(lambda: setup.find_printers(port), done, self.scan_btn)
+
+    def pick_found(self, _e: Any = None) -> None:
+        sel = self.found.curselection()
+        if not sel:
+            return
+        ip = self.found.get(sel[0])
+        if not ip[:1].isdigit():
+            return
+        self.host.delete(0, "end")
+        self.host.insert(0, ip)
+        self.probe()
+
+    def probe(self) -> None:
+        self.result.configure(text="正在连接 Connecting…", fg="#555")
+        run_probe(self.app, self.host.get(), self.port.get(), self.render.get(), self.result, self.probe_btn)
 
     def _entry(self, f: ttk.Frame, label: str, value: str, row: int) -> ttk.Entry:
         ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=(8 if row else 0, 0))
@@ -343,7 +437,7 @@ class PrinterDialog:
             port = int(self.port.get().strip() or "9100")
         except ValueError:
             port = -1
-        p = dict(self.printer, name=self.name.get().strip(), host=self.host.get().strip(), port=port, paperWidth=int(self.paper.get()), render=self.render.get(), enabled=self.enabled.get(), assignment="full")
+        p = dict(self.printer, name=self.name.get().strip(), host=self.host.get().strip(), port=port, paperWidth=80 if self.render.get() == "star" else int(self.paper.get()), render=self.render.get(), enabled=self.enabled.get(), assignment=self.printer.get("assignment") or "full")
         p = {k: v for k, v in p.items() if k in ("id", "name", "host", "port", "paperWidth", "render", "enabled", "assignment")}
 
         def done(saved: Dict[str, Any]) -> None:
@@ -355,6 +449,51 @@ class PrinterDialog:
                 self.app.test_print()
 
         self.app.bg(lambda: setup.save_printer(p), done, self.save_btn)
+
+
+MODES = {"star": "Star 光栅 raster", "image": "图片 Picture", "text": "文字 Text"}
+PROBE_ERRORS = {
+    "timeout": "连接超时：打印机没开、IP 不对或不在同一网络。\nTimed out: printer off, wrong IP, or another network.",
+    "refused": "拒绝连接：端口不对，或打印机正在给别的设备（POS）出单，稍后再试。\nConnection refused: wrong port, or the printer is busy with another device (POS); try again.",
+    "unreachable": "无法到达：这台电脑和打印机不在同一网络。\nUnreachable: this computer and the printer aren't on the same network.",
+}
+
+
+def run_probe(app: "App", host: str, port: Any, render_kind: str, label: tk.Label, button: Optional[ttk.Button]) -> None:
+    """Test connection: green when the printer answers, red with the reason when it doesn't."""
+    host = (host or "").strip()
+    if not host:
+        label.configure(text="请先填 IP 地址。Enter the IP address first.", fg="#b3261e")
+        return
+    try:
+        port_n = int(str(port).strip() or "9100")
+    except ValueError:
+        port_n = 9100
+
+    def ok(res: Dict[str, Any]) -> None:
+        st = res.get("status") or {}
+        extra = ""
+        if st.get("coverOpen"):
+            extra = "  ⚠ 盖子开着 cover open"
+        elif st.get("paperEmpty"):
+            extra = "  ⚠ 没纸了 out of paper"
+        elif st.get("paperLow"):
+            extra = "  · 纸快用完 paper low"
+        label.configure(text=f"● 已连接 Connected: {host}:{port_n} ({res.get('ms')} ms){extra}", fg="#b3261e" if ("⚠" in extra) else "#1b7f3b")
+
+    def work() -> Dict[str, Any]:
+        try:
+            return setup.test_connection(host, port_n, render_kind)
+        except PrinterError as e:
+            return {"error": PROBE_ERRORS.get(e.code, str(e))}
+
+    def show(res: Dict[str, Any]) -> None:
+        if res.get("error"):
+            label.configure(text=f"● {res['error']}", fg="#b3261e")
+        else:
+            ok(res)
+
+    app.bg(work, show, button)
 
 
 def run() -> int:

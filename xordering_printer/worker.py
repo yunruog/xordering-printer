@@ -14,7 +14,7 @@ import os
 import time
 from typing import Any, Callable, Dict, Optional
 
-from . import VERSION, api, config, escpos, ticket
+from . import VERSION, api, config, escpos, render, ticket
 from .jobs import JobStore
 from .logs import get as get_log
 from .paths import jobs_db_path, status_path
@@ -36,6 +36,9 @@ class Worker:
         self.last_error: Optional[str] = None
         self.printer_state: Dict[str, Dict[str, Any]] = {}
         self.revoked_token: Optional[str] = None
+        self.preview_done: Optional[str] = None
+        self.status_sent: Optional[str] = None
+        self.status_sent_at = 0.0
 
     # --- config ----------------------------------------------------------------------------
 
@@ -80,6 +83,7 @@ class Worker:
         self.print_due()
         if online:
             self.report(client, token)
+            self.send_status(client, token)
 
     def poll(self, client: api.Client, token: str) -> bool:
         try:
@@ -117,6 +121,10 @@ class Worker:
             changes["deviceName"] = device["name"]
         if changes:
             self._save(**changes)
+        preview = res.get("previewRequestedAt")
+        if preview and preview != self.preview_done:
+            self.preview_done = preview
+            self.upload_preview(client, token)
         jobs = res.get("jobs") or []
         listed = set()
         for job in jobs:
@@ -150,16 +158,16 @@ class Worker:
                 continue  # its printer isn't known here (yet): wait for the next poll
             job = json.loads(row["payload"])
             order = job.get("order") or {}
+            reason = job.get("reason") or "new"
             try:
-                lines = ticket.build(order, restaurant, reprint=job.get("reason") == "reprint", printer_name=printer.get("name", ""))
-                payload = escpos.ticket_bytes(lines, printer)
-                self.send(printer["host"], int(printer.get("port") or 9100), payload)
+                payload = self.ticket_payload(job, printer, restaurant)
+                status = self.send(printer["host"], int(printer.get("port") or 9100), payload, kind="star" if escpos.kind(printer) == "star" else "escpos")
             except PrinterError as e:
                 attempts = self.store.mark_failed(row["id"], str(e))
                 down.add(pid)
                 if self.printer_state.get(pid, {}).get("ok", True) or attempts == 1:
-                    self.log.warning("printer %s (%s): %s; order #%s waits", printer.get("name"), printer.get("host"), e, order.get("number"))
-                self.printer_state[pid] = {"ok": False, "error": str(e), "at": time.time()}
+                    self.log.warning("printer %s (%s): %s; order #%s waits (attempt %s)", printer.get("name"), printer.get("host"), e, order.get("number"), attempts)
+                self.printer_state[pid] = {"ok": False, "error": str(e), "code": getattr(e, "code", "error"), "at": time.time()}
                 continue
             except Exception as e:  # a ticket that can't be laid out must not stop the others
                 self.log.exception("ticket for order #%s failed", order.get("number"))
@@ -167,11 +175,56 @@ class Worker:
                 continue
             self.store.mark_printed(row["id"])
             was_down = not self.printer_state.get(pid, {}).get("ok", True)
-            self.printer_state[pid] = {"ok": True, "error": None, "at": time.time()}
-            self.log.info("printed order #%s on %s%s", order.get("number"), printer.get("name"), " (reprint)" if job.get("reason") == "reprint" else "")
+            self.printer_state[pid] = {"ok": True, "error": None, "at": time.time(), "paperLow": bool((status or {}).get("paperLow"))}
+            self.log.info("printed %s on %s%s", f"order #{order.get('number')}" if order else "the test page", printer.get("name"), "" if reason == "new" else f" ({reason})")
             if was_down:
                 self.log.info("printer %s is back", printer.get("name"))
                 self.store.retry_printer_now(pid)
+
+    @staticmethod
+    def ticket_payload(job: Dict[str, Any], printer: Dict[str, Any], restaurant: Dict[str, Any]) -> bytes:
+        reason = job.get("reason") or "new"
+        order = job.get("order")
+        if reason == "test" or not order:
+            return escpos.tickets_bytes(ticket.test_tickets(restaurant), printer)
+        lines = ticket.build(order, restaurant, reason=reason)
+        return escpos.ticket_bytes(lines, printer)
+
+    def upload_preview(self, client: api.Client, token: str) -> None:
+        """The dashboard asked for a preview: the sample tickets, drawn exactly as they print."""
+        import base64
+
+        try:
+            restaurant = self.cfg.get("restaurant") or {}
+            images = [base64.b64encode(render.png_bytes(img)).decode("ascii") for img in render.render_many(ticket.test_tickets(restaurant), 80)]
+            client.preview(token, images)
+            self.log.info("preview sent to the dashboard")
+        except (api.ApiError, api.NetworkError) as e:
+            self.preview_done = None  # try again next round
+            self.log.warning("preview upload failed: %s", e)
+        except Exception:
+            self.log.exception("preview failed")
+
+    def status_payload(self) -> Dict[str, Any]:
+        printers = {}
+        for pid, st in self.printer_state.items():
+            printers[pid] = {"ok": bool(st.get("ok")), "error": st.get("error"), "code": st.get("code"), "paperLow": bool(st.get("paperLow"))}
+        return {"version": VERSION, "printers": printers, "queue": self.store.counts()}
+
+    def send_status(self, client: api.Client, token: str) -> None:
+        """Printer states (paper out, cover open, …) for the dashboard: on a change, else every minute."""
+        st = self.status_payload()
+        key = json.dumps({"printers": st["printers"], "queued": st["queue"].get("queued")}, sort_keys=True)
+        if key == self.status_sent and time.time() - self.status_sent_at < 60:
+            return
+        try:
+            client.status(token, st)
+            self.status_sent, self.status_sent_at = key, time.time()
+        except api.ApiError as e:
+            self.status_sent, self.status_sent_at = key, time.time()  # an older server: don't hammer it
+            self.log.debug("status not sent: %s", e.code)
+        except api.NetworkError:
+            pass
 
     def report(self, client: api.Client, token: str) -> None:
         try:

@@ -1,9 +1,26 @@
-"""The kitchen ticket: an order laid out as lines, independent of how it is printed.
+"""The ticket: an order laid out as lines, independent of how it is printed.
 
-escpos.py prints these lines as ESC/POS text (Chinese in GBK) or as a picture (image mode). Widths
-count characters the way receipt printers do: a Chinese character takes two columns. 80 mm paper
-has 48 columns (Font A), 58 mm has 32; double-size text has half as many.
+One ticket per online order, in English (dish names keep their Chinese name too when the menu has
+one). From the top:
+
+    PICKUP: ASAP (~4:10 PM)            biggest text: when the customer comes
+    or, inverted, ★ SCHEDULED 6:30 PM ★
+    TSUNAMI SUSHI / ONLINE ORDER · PICKUP
+    Order #1042            Placed 3:55 PM
+    Alan · (509) 555-0134
+    qty  dish (wrapped)            amount
+         @unit price, options, Note: …
+    Order note
+    Subtotal / Tax / TOTAL
+    NOT PAID · PAY AT PICKUP
+
+A scheduled order's second ticket (20 minutes before pickup) starts with READY BY 6:30 PM · REPRINT.
+
+render.py draws these lines as a picture (Star raster and ESC/POS picture modes); escpos.py can
+also print them as ESC/POS text (Chinese in GBK). Text mode counts widths the way receipt printers
+do: a Chinese character takes two columns; 80 mm paper has 48 columns (Font A), 58 mm 32.
 """
+import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -13,15 +30,20 @@ from typing import Any, Dict, List, Optional
 class Line:
     text: str = ""
     right: str = ""
-    # 1: normal; 2: double width and height (headings, dishes)
+    # 1: normal; 2: large (store name, TOTAL); 3: largest (the pickup time)
     size: int = 1
     align: str = "left"  # left | center
     bold: bool = False
-    invert: bool = False
-    kind: str = "text"  # text | rule | feed
+    invert: bool = False  # white on black
+    kind: str = "text"  # text | rule | double | feed
+    # A left column (the quantity): wrapped rows of `text` keep to the right of it.
+    lead: str = ""
+    # Rows start where the text after a `lead` starts (lines under a dish).
+    indent: int = 0
 
 
 CURRENCY = {"CAD": "$", "USD": "$", "AUD": "$", "HKD": "HK$", "CNY": "¥", "GBP": "£", "EUR": "€", "TWD": "NT$"}
+LEAD_COLS = 4  # "12  " — the quantity column
 
 
 def money(cents: Optional[int], currency: str = "CAD") -> str:
@@ -31,18 +53,25 @@ def money(cents: Optional[int], currency: str = "CAD") -> str:
     return f"{sign}{CURRENCY.get(currency, currency + ' ')}{a // 100}.{a % 100:02d}"
 
 
+def amount(cents: Optional[int]) -> str:
+    """A price without the currency sign (dish lines): 14.95."""
+    cents = int(cents or 0)
+    return f"{'-' if cents < 0 else ''}{abs(cents) // 100}.{abs(cents) % 100:02d}"
+
+
 def width(s: str) -> int:
     return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 0 if unicodedata.combining(c) else 1 for c in s)
 
 
 def columns(paper_width: int, size: int = 1) -> int:
     base = 32 if int(paper_width) == 58 else 48
-    return base // size
+    return base // min(2, max(1, size))
 
 
 def wrap(text: str, cols: int) -> List[str]:
     """Greedy wrap: Latin words stay whole when they fit; CJK breaks between any two characters."""
     out: List[str] = []
+    cols = max(1, cols)
     for para in (text or "").replace("\r", "").split("\n"):
         tokens: List[str] = []
         word = ""
@@ -75,121 +104,202 @@ def wrap(text: str, cols: int) -> List[str]:
 
 
 def layout(line: Line, paper_width: int) -> List[str]:
-    """One Line as the rows it prints, padded to the line width (right text right-aligned)."""
+    """One Line as the text rows it prints (text mode), padded so right text ends at the edge."""
     cols = columns(paper_width, line.size)
-    if line.kind == "rule":
-        return ["-" * columns(paper_width)]
+    if line.kind in ("rule", "double"):
+        return [("=" if line.kind == "double" else "-") * columns(paper_width)]
     if line.kind == "feed":
         return [""]
-    if not line.right:
-        rows = wrap(line.text, cols)
-        if line.align == "center":
-            return [" " * max(0, (cols - width(r)) // 2) + r for r in rows]
-        return rows
-    rows = wrap(line.text, cols)
-    last = rows[-1]
-    if width(last) + 1 + width(line.right) <= cols:
-        rows[-1] = last + " " * (cols - width(last) - width(line.right)) + line.right
-    else:
-        rows.append(" " * max(0, cols - width(line.right)) + line.right)
+    pad = LEAD_COLS if (line.lead or line.indent) else 0
+    prefix = (line.lead or "").ljust(pad) if pad else ""
+    rows = wrap(line.text, cols - pad)
+    rows = [(prefix if i == 0 else " " * pad) + r for i, r in enumerate(rows)]
+    if line.right:
+        last = rows[-1]
+        if width(last) + 1 + width(line.right) <= cols:
+            rows[-1] = last + " " * (cols - width(last) - width(line.right)) + line.right
+        else:
+            rows.append(" " * max(0, cols - width(line.right)) + line.right)
+    elif line.align == "center":
+        rows = [" " * max(0, (cols - width(r)) // 2) + r for r in rows]
     return rows
 
 
 def name_parts(value: Any) -> List[str]:
-    """A localized name as [Chinese, English] (each only when present and different)."""
+    """A localized name as [English, Chinese] (each only when present and different)."""
     if isinstance(value, dict):
         zh = str(value.get("zh") or "").strip()
         en = str(value.get("en") or "").strip()
-        return [x for x in (zh, en if en != zh else "") if x]
+        return [x for x in (en, zh if zh != en else "") if x]
     return [str(value or "").strip()]
 
 
-FULFILLMENT = {"pickup": "自取 PICKUP", "dine_in": "堂食 DINE-IN", "delivery": "外送 DELIVERY"}
+def restaurant_name(restaurant: Dict[str, Any]) -> str:
+    parts = name_parts((restaurant or {}).get("name"))
+    return parts[0] if parts else ""
 
 
-def build(order: Dict[str, Any], restaurant: Dict[str, Any], *, reprint: bool = False, printer_name: str = "") -> List[Line]:
+def phone(value: str) -> str:
+    """(509) 555-0134 for North American numbers, otherwise as given."""
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    return (value or "").strip()
+
+
+def clock(value: Optional[str]) -> str:
+    """'2026-11-25 18:32' (or '18:32') -> '6:32 PM'; anything else unchanged."""
+    m = re.search(r"(\d{1,2}):(\d{2})(?::\d{2})?$", (value or "").strip())
+    if not m:
+        return (value or "").strip()
+    h, mi = int(m.group(1)), m.group(2)
+    return f"{(h % 12) or 12}:{mi} {'AM' if h < 12 else 'PM'}"
+
+
+HOW = {"pickup": "PICKUP", "dine_in": "DINE-IN", "delivery": "DELIVERY"}
+
+
+def headline(order: Dict[str, Any], reason: str = "new") -> List[Line]:
+    """The top of the ticket: when (pickup time) or where (table), in the biggest type."""
+    fulfillment = order.get("fulfillment") or "pickup"
+    pickup = clock(order.get("pickupAtLocal")) if order.get("pickupAt") else ""
+    out: List[Line] = []
+    if reason == "scheduled" and pickup:
+        out.append(Line(f"READY BY {pickup} · REPRINT", size=2, align="center", bold=True, invert=True))
+    elif reason == "reprint":
+        out.append(Line("REPRINT", size=2, align="center", bold=True, invert=True))
+    elif reason == "test":
+        out.append(Line("TEST PRINT · 测试打印", size=2, align="center", bold=True, invert=True))
+    if fulfillment == "dine_in":
+        table = order.get("tableLabel")
+        out.append(Line(f"DINE-IN · TABLE {table}" if table else "DINE-IN", size=3, align="center", bold=True))
+    elif pickup:
+        out.append(Line(f"★ SCHEDULED {pickup} ★", size=3, align="center", bold=True, invert=True))
+    else:
+        ready = clock(order.get("readyAtLocal"))
+        word = HOW.get(fulfillment, fulfillment.upper())
+        out.append(Line(f"{word}: ASAP (~{ready})" if ready else f"{word}: ASAP", size=3, align="center", bold=True))
+    return out
+
+
+def build(order: Dict[str, Any], restaurant: Dict[str, Any], *, reason: str = "new", printer_name: str = "", reprint: Optional[bool] = None) -> List[Line]:
+    """The ticket for one order. reason: new | reprint (dashboard) | scheduled (before pickup) | test."""
+    if reprint:  # older callers
+        reason = "reprint"
     cur = order.get("currency") or restaurant.get("currency") or "CAD"
-    lines: List[Line] = []
-    names = name_parts(restaurant.get("name"))
-    lines.append(Line(names[0] if names else "", size=2, align="center", bold=True))
-    if len(names) > 1:
-        lines.append(Line(names[1], align="center"))
-    if reprint:
-        lines.append(Line(" 重新打印 REPRINT ", align="center", bold=True, invert=True))
-    lines.append(Line("", kind="feed"))
-    lines.append(Line(f"#{int(order.get('number') or 0):04d}", size=2, align="center", bold=True))
-    how = FULFILLMENT.get(order.get("fulfillment") or "pickup", str(order.get("fulfillment")))
-    if order.get("fulfillment") == "dine_in" and order.get("tableLabel"):
-        how = f"堂食 桌号 {order['tableLabel']}"
-    lines.append(Line(how, size=2, align="center", bold=True))
-    if order.get("fulfillment") == "dine_in" and order.get("tableLabel"):
-        lines.append(Line(f"DINE-IN - TABLE {order['tableLabel']}", align="center"))
+    fulfillment = order.get("fulfillment") or "pickup"
+    lines = headline(order, reason)
+    lines.append(Line(kind="double"))
+    name = restaurant_name(restaurant)
+    if name:
+        lines.append(Line(name.upper(), size=2, align="center", bold=True))
+    lines.append(Line(f"ONLINE ORDER · {HOW.get(fulfillment, fulfillment.upper())}", align="center"))
+    lines.append(Line(kind="double"))
+
+    placed = clock(order.get("placedAtLocal") or order.get("createdAtLocal") or "")
+    lines.append(Line(f"Order #{int(order.get('number') or 0)}", right=f"Placed {placed}" if placed else "", bold=True))
+    customer = order.get("customer") or {}
+    who = " · ".join(x for x in (str(customer.get("name") or "").strip(), phone(str(customer.get("phone") or ""))) if x)
+    if who:
+        lines.append(Line(who))
     addr = order.get("deliveryAddress")
     if addr:
         text = addr if isinstance(addr, str) else " ".join(str(v) for v in addr.values() if v)
-        lines.append(Line(f"地址 Address: {text}", bold=True))
-    lines.append(Line(f"下单 Placed  {order.get('createdAtLocal') or str(order.get('createdAt', ''))[:16]}", align="center"))
+        lines.append(Line(f"Address: {text}", bold=True))
     lines.append(Line(kind="rule"))
 
     for item in order.get("lines") or []:
         parts = name_parts(item.get("name"))
         qty = int(item.get("quantity") or 1)
-        lines.append(Line(f"{qty} x {parts[0] if parts else ''}", size=2, bold=True))
-        if len(parts) > 1:
-            lines.append(Line(f"    {parts[1]}"))
+        total = amount(item.get("lineTotalCents"))
+        unit = item.get("unitPriceCents")
+        lines.append(Line(parts[0] if parts else "", lead=str(qty), right="" if qty > 1 else total, bold=True))
+        for extra in parts[1:]:
+            lines.append(Line(extra, indent=1))
         for opt in item.get("options") or []:
             group = (name_parts(opt.get("group")) or [""])[0]
-            choice = " ".join(name_parts(opt.get("choice")))
+            choice = " / ".join(name_parts(opt.get("choice")))
             delta = int(opt.get("priceDeltaCents") or 0)
-            extra = f" ({'+' if delta > 0 else '-'}{money(abs(delta), cur)})" if delta else ""
-            lines.append(Line(f"  - {group}: {choice}{extra}", bold=True))
+            plus = f" (+{amount(delta)})" if delta > 0 else f" ({amount(delta)})" if delta < 0 else ""
+            lines.append(Line(f"{group}: {choice}{plus}" if group else f"{choice}{plus}", indent=1))
+        if qty > 1:
+            each = unit if unit is not None else (int(item.get("lineTotalCents") or 0) // qty)
+            lines.append(Line(f"@{amount(each)}", right=total, indent=1))
         if item.get("note"):
-            lines.append(Line(f"  * 备注 Note: {item['note']}", bold=True))
-        lines.append(Line("", right=money(item.get("lineTotalCents"), cur)))
+            lines.append(Line(f"Note: {item['note']}", indent=1, bold=True))
     lines.append(Line(kind="rule"))
-
-    lines.append(Line("小计 Subtotal", right=money(order.get("subtotalCents"), cur)))
-    if order.get("taxCents"):
-        lines.append(Line("税 Tax", right=money(order.get("taxCents"), cur)))
-    if order.get("tipCents"):
-        lines.append(Line("小费 Tip", right=money(order.get("tipCents"), cur)))
-    if order.get("deliveryFeeCents"):
-        lines.append(Line("配送费 Delivery", right=money(order.get("deliveryFeeCents"), cur)))
-    lines.append(Line("合计 TOTAL", right=money(order.get("totalCents"), cur), size=2, bold=True))
-    lines.append(Line("已付款 PAID" if order.get("paymentStatus") == "paid" else "到店付款 Pay at restaurant", align="center"))
 
     if order.get("notes"):
+        lines.append(Line(f"Note: {order['notes']}", bold=True))
         lines.append(Line(kind="rule"))
-        lines.append(Line("顾客备注 Customer note:", bold=True))
-        lines.append(Line(str(order["notes"]), size=2, bold=True))
-    lines.append(Line(kind="rule"))
-    customer = order.get("customer") or {}
-    if customer.get("name") or customer.get("phone"):
-        lines.append(Line(f"顾客 {customer.get('name') or ''}  {customer.get('phone') or ''}".strip()))
+
+    lines.append(Line("Subtotal", right=amount(order.get("subtotalCents"))))
+    lines.append(Line("Tax", right=amount(order.get("taxCents"))))
+    if order.get("tipCents"):
+        lines.append(Line("Tip", right=amount(order.get("tipCents"))))
+    if order.get("deliveryFeeCents"):
+        lines.append(Line("Delivery", right=amount(order.get("deliveryFeeCents"))))
+    lines.append(Line("TOTAL", right=money(order.get("totalCents"), cur), size=2, bold=True))
+    if order.get("paymentStatus") == "paid":
+        lines.append(Line("PAID", align="center", bold=True))
+    else:
+        pay = "PAY AT PICKUP" if fulfillment == "pickup" else "PAY AT THE RESTAURANT"
+        lines.append(Line(f"NOT PAID · {pay}", align="center", bold=True))
+    lines.append(Line(kind="double"))
     if printer_name:
-        lines.append(Line(f"{printer_name}", align="center"))
+        lines.append(Line(printer_name, align="center"))
     return lines
 
 
+# --- The test page and the preview: one sample order, both pickup styles ----------------------------
+
+def sample_orders(restaurant: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Two sample orders (ASAP and scheduled) with a long dish name and a Chinese note."""
+    r = restaurant or {}
+    tax_bps = int(r.get("taxRateBps") if r.get("taxRateBps") is not None else 500)
+    prep = int(r.get("prepMinutes") or 15)
+    lines = [
+        {"name": {"en": "Tuna Pepper"}, "quantity": 1, "unitPriceCents": 1495, "lineTotalCents": 1495, "options": [], "note": ""},
+        {"name": {"en": "Shrimp Tempura Appetizer with Spicy Mayo and Extra Crispy Flakes", "zh": "天妇罗虾"}, "quantity": 2,
+         "unitPriceCents": 995, "lineTotalCents": 1990, "options": [], "note": "no wasabi"},
+        {"name": {"en": "Dragon Roll"}, "quantity": 1, "unitPriceCents": 1750, "lineTotalCents": 1750,
+         "options": [{"group": {"en": "Rice"}, "choice": {"en": "Brown rice"}, "priceDeltaCents": 100}], "note": ""},
+    ]
+    subtotal = sum(x["lineTotalCents"] for x in lines)
+    tax = round(subtotal * tax_bps / 10000)
+    placed = 15 * 60 + 55
+    ready = placed + prep
+    base = {
+        "number": 1042, "fulfillment": "pickup", "currency": r.get("currency") or "CAD",
+        "placedAtLocal": f"{placed // 60:02d}:{placed % 60:02d}", "readyAtLocal": f"{ready // 60 % 24:02d}:{ready % 60:02d}",
+        "customer": {"name": "Alan", "phone": "+15095550134"},
+        "notes": "少放酱油，谢谢！Please call when ready.", "lines": lines,
+        "subtotalCents": subtotal, "taxCents": tax, "totalCents": subtotal + tax, "paymentStatus": "unpaid",
+    }
+    scheduled = dict(base, number=1043, pickupAt="2026-01-01T18:30:00", pickupAtLocal="18:30", customer={"name": "陈小姐", "phone": "+16045550187"})
+    return [base, scheduled]
+
+
+def test_tickets(restaurant: Optional[Dict[str, Any]] = None) -> List[List[Line]]:
+    """The test page: the sample order as an ASAP ticket and as a scheduled one."""
+    return [build(o, restaurant or {}, reason="test") for o in sample_orders(restaurant)]
+
+
 def test_lines(printer: Dict[str, Any], restaurant: Optional[Dict[str, Any]] = None) -> List[Line]:
-    """The setup's test print: Chinese and English, the sizes the kitchen ticket uses, and the address."""
-    names = name_parts((restaurant or {}).get("name")) if restaurant else []
+    """The setup's connection test: one short ticket naming the printer (and Chinese, to check GBK)."""
+    mode = {"star": "Star raster (TSP100)", "image": "ESC/POS picture", "text": "ESC/POS text (GBK)"}.get(printer.get("render") or "text", "")
     return [
-        Line("测试打印 TEST PRINT", size=2, align="center", bold=True),
-        Line(names[0] if names else "XOrdering", align="center"),
+        Line("TEST PRINT · 测试打印", size=2, align="center", bold=True, invert=True),
+        Line(restaurant_name(restaurant or {}) or "XOrdering", align="center", bold=True),
         Line(kind="rule"),
-        Line(f"打印机 Printer: {printer.get('name', '')}"),
-        Line(f"地址 Address: {printer.get('host', '')}:{printer.get('port', 9100)}"),
-        Line(f"纸宽 Paper: {printer.get('paperWidth', 80)} mm · {'图片 Picture' if printer.get('render') == 'image' else '文字 Text (GBK)'}"),
+        Line(f"Printer: {printer.get('name', '')}"),
+        Line(f"Address: {printer.get('host', '')}:{printer.get('port', 9100)}"),
+        Line(f"Paper: {printer.get('paperWidth', 80)} mm · {mode}"),
         Line(kind="rule"),
-        Line("2 x 宫保鸡丁", size=2, bold=True),
-        Line("    Kung Pao Chicken"),
-        Line("  - 辣度: 特辣 (+$1.00)", bold=True),
-        Line("", right="$27.76"),
         Line("中文测试：麻婆豆腐 干炒牛河 小笼包", bold=True),
         Line(kind="rule"),
-        Line("如果上面的中文是乱码，请在设置里把", align="center"),
-        Line("“中文打印方式”改成“图片”。", align="center"),
-        Line("Garbled Chinese above? Set Chinese", align="center"),
-        Line("text to Picture for this printer.", align="center"),
+        Line("If this prints, the printer is set up.", align="center"),
+        Line("Garbled Chinese in text mode? Use Picture.", align="center"),
     ]

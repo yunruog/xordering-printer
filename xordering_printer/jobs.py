@@ -10,6 +10,7 @@ the report, say the internet dropped) only repeats the report. A reprint from th
 new job id, so it prints. Rows are kept 14 days, then pruned.
 """
 import json
+import random
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional
@@ -32,6 +33,8 @@ create table if not exists jobs (
 create index if not exists jobs_state on jobs (state, next_attempt);
 """
 
+# Seconds before the next try after 1, 2, 3, … failures (plus up to 25 % at random, so two programs
+# sharing a printer with the POS don't keep colliding). The ticket stays queued meanwhile.
 BACKOFF = [2, 5, 10, 20, 30]
 
 
@@ -66,7 +69,7 @@ class JobStore:
     def mark_failed(self, job_id: str, error: str) -> int:
         row = self.get(job_id)
         attempts = (row["attempts"] if row else 0) + 1
-        delay = BACKOFF[min(attempts - 1, len(BACKOFF) - 1)]
+        delay = BACKOFF[min(attempts - 1, len(BACKOFF) - 1)] * (1 + random.random() * 0.25)
         self.db.execute("update jobs set attempts = ?, last_error = ?, next_attempt = ? where id = ? and state = 'queued'", (attempts, error[:300], time.time() + delay, job_id))
         return attempts
 

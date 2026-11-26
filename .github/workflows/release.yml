@@ -23,7 +23,7 @@ jobs:
       - name: Tests
         run: python -m unittest discover -s tests -t . -v
       - name: Build one exe (no console window, nothing to install)
-        run: pyinstaller --noconfirm --onefile --windowed --name XOrderingPrinter --collect-submodules xordering_printer XOrderingPrinter.py
+        run: pyinstaller --noconfirm --onefile --windowed --name XOrderingPrinter --collect-submodules xordering_printer --add-data "xordering_printer/fonts:xordering_printer/fonts" XOrderingPrinter.py
       - name: Smoke test the exe (the worker starts and writes its status)
         shell: pwsh
         run: |
@@ -34,6 +34,13 @@ jobs:
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           $status = Get-Content (Join-Path $env:XORDERING_PRINTER_HOME "status.json") | ConvertFrom-Json
           if ($status.state -ne "setup") { throw "unexpected state $($status.state)" }
+      - name: Smoke test the bundled font (the ticket picture draws Chinese with it)
+        shell: pwsh
+        run: |
+          $env:XORDERING_PRINTER_HOME = Join-Path $env:RUNNER_TEMP "xop-font"
+          $p = Start-Process -FilePath dist\XOrderingPrinter.exe -ArgumentList "--self-check" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "self-check failed ($($p.ExitCode))" }
+          Get-Content (Join-Path $env:XORDERING_PRINTER_HOME "self-check.json")
           "status: version $($status.version), state $($status.state)"
       - name: Checksum
         shell: pwsh

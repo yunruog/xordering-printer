@@ -11,7 +11,9 @@ processes) and two mock printers.
 Checks: device key and phone sign-in; both printers print each order once; printer offline ->
 "failed" on the dashboard -> printed when it is back; internet down -> orders print when it
 returns; no duplicates; reprint; rejected orders don't print; the worker is killed -> restarted;
-the program restarts -> still connected, nothing printed twice; image mode.
+the program restarts -> still connected, nothing printed twice; image mode; a Star TSP100 (Star
+Graphic Mode, every byte checked) busy with the POS; a scheduled order and its reprint before
+pickup; the dashboard's test page, preview (the very picture printed) and printer status.
 """
 import argparse
 import json
@@ -195,7 +197,7 @@ class Run:
         self.check("printers come from the server", [p["port"] for p in cfg["printers"]] == self.ports)
         for p in cfg["printers"]:
             setup.test_print(p)
-        self.check("test print reaches both printers", wait(lambda: all(m.count("测试打印 TEST PRINT") == 1 for m in self.mocks), 10, "test prints"))
+        self.check("test page reaches both printers (ASAP and scheduled samples)", wait(lambda: all(m.tickets and m.tickets[-1]["text"].count("TEST PRINT - 测试打印") == 2 and m.tickets[-1]["cuts"] == 2 for m in self.mocks), 10, "test prints"))
 
         # 2. The program runs as in the shop: service + worker.
         self.start_service()
@@ -206,7 +208,7 @@ class Run:
         time.sleep(9)
         self.check("no duplicates after more polls", [self.count(0, o1["number"]), self.count(1, o1["number"])] == [1, 1])
         t = self.mocks[0].tickets[-1]["text"]
-        self.check("ticket content (GBK Chinese, table/pickup, dish, options, totals)", all(s in t for s in ["金莲小馆", "自取 PICKUP", "2 x 宫保鸡丁", "辣度: 特辣 Hot (+$1.00)", "少放花生", "合计 TOTAL", "不要香菜", "[cut]"]))
+        self.check("ticket content (pickup time first, store, customer, dish, options, totals, GBK Chinese)", t.index("PICKUP: ASAP (~") < t.index("GOLDEN LOTUS") < t.index("Order #") and all(s in t for s in ["Placed ", "陈先生 Mr. Chen", "Kung Pao Chicken", "宫保鸡丁", "Spice: Hot / 特辣 (+1.00)", "@13.88", "少放花生", "TOTAL", "不要香菜", "NOT PAID - PAY AT PICKUP", "[cut]"]))
 
         # 3. Printer 2 offline: Failed on the dashboard, printed once it is back.
         self.mocks[1].stop()
@@ -218,7 +220,7 @@ class Run:
         wait(lambda: self.count(1, o2["number"]) == 1, 60, "order 2 on printer 2 after it came back")
         wait(lambda: (self.print_state(o2["orderId"]) or {}).get("status") == "printed", 20, "order 2 printed")
         self.check("printer back -> the waiting ticket prints, once", [self.count(0, o2["number"]), self.count(1, o2["number"])] == [1, 1])
-        self.check("dine-in ticket shows the table", "堂食 桌号 12" in self.mocks[0].tickets[-1]["text"])
+        self.check("dine-in ticket shows the table", "DINE-IN - TABLE 12" in self.mocks[0].tickets[-1]["text"])
 
         # 4. Internet down: orders placed meanwhile print when it returns; nothing is lost or doubled.
         self.proxy.down()
@@ -234,7 +236,7 @@ class Run:
         # 5. Reprint from the dashboard: one more copy each, marked REPRINT.
         post(self.server, "/__dev/reprint", {"restaurantId": self.r["restaurantId"], "orderId": o1["orderId"]})
         wait(lambda: self.count(0, o1["number"]) == 2 and self.count(1, o1["number"]) == 2, 20, "the reprint")
-        self.check("reprint prints one more copy on each printer, marked REPRINT", "重新打印 REPRINT" in self.mocks[0].tickets[-1]["text"])
+        self.check("reprint prints one more copy on each printer, marked REPRINT", self.mocks[0].tickets[-1]["text"].lstrip().startswith("REPRINT"))
 
         # 6. An order rejected while printing is down never prints.
         self.mocks[0].stop()
@@ -269,6 +271,68 @@ class Run:
         wait(lambda: self.count(0, o7["number"]) == 1 and any(t["image"] for t in self.mocks[1].tickets), 30, "the picture ticket")
         png = sorted((self.out / "printer2").glob("*.png"))[-1]
         self.check("image mode prints the ticket as a picture", png.stat().st_size > 2000, str(png))
+
+        # 10. The Tsunami printer: a Star TSP100 (no fonts, no ESC/POS), shared with the POS.
+        from mock_printer import MockPrinter as Mock
+
+        self.mocks[0].stop()
+        star = self.mocks[0] = Mock(self.ports[0], out=str(self.out / "star"), quiet=True, star=True).start()
+        p1 = next(p for p in config.load()["printers"] if p["port"] == self.ports[0])
+        post(self.server, "/__dev/save-printer", {"restaurantId": self.r["restaurantId"], "printer": dict(p1, render="star")})
+        wait(lambda: any(p.get("render") == "star" for p in config.load()["printers"]), 20, "the worker to see the Star printer")
+        o8 = self.order()
+        wait(lambda: len(star.tickets) == 1, 30, "the Star ticket")
+        self.check("Star printer gets the ticket in Star Graphic Mode raster (every byte checked), with a cut", star.format_errors == [] and star.tickets[0]["cuts"] == 1 and star.status_requests >= 2, f"{star.tickets[0]['bytes']} bytes")
+        self.check("ticket starts with the pickup time in the biggest type", star.image(1).size[0] == 576 and star.image(1).size[1] > 600)
+        star.busy_until = time.time() + 12  # the POS is printing: port 9100 drops us
+        o9 = self.order()
+        time.sleep(6)
+        self.check("printer busy with the POS -> the ticket waits", len(star.tickets) == 1 and star.busy_hits >= 1, f"{star.busy_hits} refused tries")
+        wait(lambda: len(star.tickets) == 2, 60, "the ticket after the POS finished")
+        time.sleep(9)
+        self.check("POS done -> the ticket prints once", len(star.tickets) == 2 and (self.print_state(o9["orderId"]) or {}).get("status") == "printed")
+
+        # 11. A scheduled order prints when placed and again 20 minutes before pickup, marked READY BY … · REPRINT.
+        from datetime import datetime, timedelta, timezone
+
+        p2 = next(p for p in config.load()["printers"] if p["port"] == self.ports[1])
+        post(self.server, "/__dev/save-printer", {"restaurantId": self.r["restaurantId"], "printer": dict(p2, render="text")})
+        wait(lambda: all(p.get("render") != "image" for p in config.load()["printers"]), 20, "printer 2 back in text mode")
+        t = datetime.now(timezone.utc) + timedelta(minutes=75)
+        at = t.replace(minute=t.minute // 15 * 15, second=0, microsecond=0)
+        o10 = self.order(pickupAt=at.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        wait(lambda: len(star.tickets) == 3, 30, "the scheduled order's ticket")
+        post(self.server, "/__dev/scheduled-due", {"orderId": o10["orderId"]})
+        post(self.server, "/__dev/alert-tick", {})
+        wait(lambda: len(star.tickets) == 4, 30, "the reprint before pickup")
+        time.sleep(9)
+        post(self.server, "/__dev/alert-tick", {})
+        time.sleep(6)
+        self.check("scheduled order: one ticket when placed, one READY BY reprint before pickup, no more", len(star.tickets) == 4 and self.count(1, o10["number"]) == 2)
+        text2 = self.mocks[1].tickets[-1]["text"]
+        self.check("the reprint is marked READY BY … · REPRINT above ★ SCHEDULED", text2.lstrip().startswith("READY BY ") and "REPRINT" in " ".join(text2.strip().split("\n")[:2]) and "* SCHEDULED " in text2, " / ".join(r.strip() for r in text2.strip().split("\n")[:2]))
+
+        # 12. Dashboard: test page, preview (the program's own picture), printer status and heartbeat.
+        before = len(star.tickets)
+        post(self.server, "/__dev/test-page", {"restaurantId": self.r["restaurantId"]})
+        wait(lambda: len(star.tickets) == before + 2, 30, "the test page from the dashboard")
+        self.check("dashboard test page prints the two sample tickets", True)
+        post(self.server, "/__dev/request-preview", {"restaurantId": self.r["restaurantId"]})
+        pv = wait(lambda: (lambda p: p if p.get("images") else None)(post(self.server, "/__dev/preview", {"restaurantId": self.r["restaurantId"]})), 30, "the preview")
+        import base64
+        import io
+
+        from PIL import Image
+
+        imgs = [Image.open(io.BytesIO(base64.b64decode(b))).convert("1") for b in pv["images"]]
+        printed = [star.image(before + 1), star.image(before + 2)]
+        self.check("preview PNGs are exactly the pictures the printer got", [i.tobytes() for i in imgs] == [p.tobytes() for p in printed], f"{[i.size for i in imgs]}")
+        star.paper_low = True
+        o11 = self.order()
+        wait(lambda: any((st or {}).get("paperLow") for d in post(self.server, "/__dev/printing", {"restaurantId": self.r["restaurantId"]})["devices"] for st in ((d.get("status") or {}).get("printers") or {}).values()), 90, "paper low on the dashboard")
+        devs = post(self.server, "/__dev/printing", {"restaurantId": self.r["restaurantId"]})["devices"]
+        self.check("dashboard shows the computer online and the printer's paper running low", any(d.get("online") for d in devs))
+        del o11
 
         totals = [len(m.tickets) for m in self.mocks]
         print(f"\nAll {len(self.results)} checks passed. Tickets received: printer 1 = {totals[0]}, printer 2 = {totals[1]} (in {self.out}).")

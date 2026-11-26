@@ -14,9 +14,13 @@ class FakeServer:
         self.online = True
         self.revoked = False
         self.reports = []
+        self.statuses = []
+        self.previews = []
+        self.preview_requested = None
 
-    def add(self, job_id, printer_id, number, reason="new"):
-        self.jobs[job_id] = {"id": job_id, "printerId": printer_id, "reason": reason, "status": "pending", "order": dict(ORDER, number=number)}
+    def add(self, job_id, printer_id, number, reason="new", **order):
+        o = None if reason == "test" else dict(ORDER, number=number, **order)
+        self.jobs[job_id] = {"id": job_id, "printerId": printer_id, "reason": reason, "status": "pending", "order": o}
 
     def client(self, cfg):
         server = self
@@ -28,8 +32,17 @@ class FakeServer:
                     raise api.NetworkError("offline")
                 if server.revoked:
                     raise api.ApiError("device_revoked", 400)
-                return {"restaurant": {"id": "r-1", "name": {"zh": "金莲小馆", "en": "Golden Lotus"}, "currency": "CAD"}, "printers": server.printers, "device": {"name": "PC"},
+                return {"restaurant": {"id": "r-1", "name": {"zh": "金莲小馆", "en": "Golden Lotus"}, "currency": "CAD", "taxRateBps": 500, "prepMinutes": 15},
+                        "printers": server.printers, "device": {"name": "PC"}, "previewRequestedAt": server.preview_requested,
                         "jobs": [j for j in server.jobs.values() if j["status"] in ("pending", "failed")]}
+
+            def status(self, token, st):
+                if not server.online:
+                    raise api.NetworkError("offline")
+                server.statuses.append(st)
+
+            def preview(self, token, images):
+                server.previews.append(images)
 
             def report(self, token, job_id, status, error=None):
                 if not server.online:

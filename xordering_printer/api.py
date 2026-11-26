@@ -1,7 +1,8 @@
 """Talking to the XOrdering server (Supabase: SQL functions over HTTPS), standard library only.
 
 Every call after setup uses only the device token: print_device_poll (the restaurant, its printers
-and the tickets to print), print_device_report (printed / failed) and print_device_save_printer.
+and the tickets to print), print_device_report (printed / failed), print_device_save_printer,
+print_device_status (printer states) and print_device_preview (the sample tickets as PNG).
 Setup uses either a device key (print_device_pair) or the owner's phone sign-in (the same SMS code
 as the dashboard), which is used once to register this computer and then signed out.
 """
@@ -122,6 +123,14 @@ class Client:
 
     def save_printer(self, token: str, printer: Dict[str, Any]) -> Dict[str, Any]:
         return self.rpc("print_device_save_printer", {"p_token": token, "p_printer": printer})
+
+    def status(self, token: str, status: Dict[str, Any]) -> Any:
+        """Printer states and the local queue, for the dashboard."""
+        return self.rpc("print_device_status", {"p_token": token, "p_status": status})
+
+    def preview(self, token: str, images: List[str]) -> Any:
+        """The sample tickets as PNG (base64), drawn exactly as they print."""
+        return self.rpc("print_device_preview", {"p_token": token, "p_images": images}, timeout=30)
 
 
 def client_for(cfg: Dict[str, Any]) -> Client:
