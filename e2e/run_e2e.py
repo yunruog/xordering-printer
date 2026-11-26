@@ -8,7 +8,7 @@ processes) and two mock printers.
     python e2e/run_e2e.py --xordering ../xordering        # starts the dev server itself
     python e2e/run_e2e.py --server http://127.0.0.1:8787   # or uses a running one
 
-Checks: device key and phone sign-in; both printers print each order once; printer offline ->
+Checks: device key and email sign-in (the dashboard's 6-digit email code; no SMS); both printers print each order once; printer offline ->
 "failed" on the dashboard -> printed when it is back; internet down -> orders print when it
 returns; no duplicates; reprint; rejected orders don't print; the worker is killed -> restarted;
 the program restarts -> still connected, nothing printed twice; image mode; a Star TSP100 (Star
@@ -47,6 +47,11 @@ def post(base: str, path: str, body=None):
     with urllib.request.urlopen(req, timeout=20) as r:
         raw = r.read()
         return json.loads(raw) if raw else None
+
+
+def get(base: str, path: str):
+    with urllib.request.urlopen(base + path, timeout=20) as r:
+        return json.loads(r.read())
 
 
 class Proxy:
@@ -178,11 +183,30 @@ class Run:
         self.r = post(self.server, "/__dev/setup", {"printers": [{"name": "后厨 Kitchen 1", "host": "127.0.0.1", "port": self.ports[0]}, {"name": "后厨 Kitchen 2", "host": "127.0.0.1", "port": self.ports[1]}]})
         config.update(site=self.site)
 
-        # 1. Phone sign-in (owner) registers a computer; then a device key connects this one.
+        # 1. Email sign-in (owner) registers a computer; then a device key connects this one.
         setup.connect_server(self.site)
-        session = setup.sign_in("+16045550100", "123456")
+        owner_email = "Owner@Golden-Lotus.example"
+        sent = setup.send_code(owner_email, "zh")
+        self.check("email sign-in: a code is emailed (60 s resend cooldown)", sent.get("cooldownSeconds") == 60 and sent.get("expiresInMinutes") == 10)
+        try:
+            setup.send_code(owner_email)
+            self.check("email sign-in: resending at once is refused (cooldown)", False)
+        except api.ApiError as e:
+            self.check("email sign-in: resending at once is refused (cooldown)", e.code == "cooldown" and 0 < e.payload.get("waitSeconds", 0) <= 60)
+        code = get(self.server, "/__dev/last-code?email=owner@golden-lotus.example")["code"]
+        try:
+            setup.sign_in(owner_email, "000000" if code != "000000" else "111111")
+            self.check("email sign-in: a wrong code is refused", False)
+        except api.ApiError as e:
+            self.check("email sign-in: a wrong code is refused", e.code == "invalid_code" and e.payload.get("attemptsLeft") == 4)
+        try:
+            setup.send_code("not an email")
+            self.check("email sign-in: a bad email is refused", False)
+        except api.ApiError as e:
+            self.check("email sign-in: a bad email is refused", e.code == "invalid_email")
+        session = setup.sign_in(owner_email, code)
         rs = setup.owned_restaurants(session)
-        self.check("phone sign-in finds the owner's restaurant", any(r["id"] == self.r["restaurantId"] for r in rs))
+        self.check("email sign-in finds the owner's restaurant", any(r["id"] == self.r["restaurantId"] for r in rs))
         reg = api.client_for(config.load()).register(session, self.r["restaurantId"], "Office PC")
         self.check("signed-in owner registers a device token", reg["token"].startswith("xpd_"))
         key = post(self.server, "/__dev/device-key", {"restaurantId": self.r["restaurantId"]})["key"]

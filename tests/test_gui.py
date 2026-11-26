@@ -19,6 +19,17 @@ class GuiTest(unittest.TestCase):
             app = gui.App(root)
             root.update()
             self.assertEqual(app.view, "connect")
+            texts = []
+            stack = [root]
+            while stack:
+                w = stack.pop()
+                stack.extend(w.winfo_children())
+                try:
+                    texts.append(str(w.cget("text")))
+                except tk.TclError:
+                    pass
+            self.assertTrue(any("推荐：在后台 Settings > Kitchen printers" in t for t in texts))
+            self.assertTrue(any("邮箱 Email" == t for t in texts))
             config.update(supabaseUrl="http://127.0.0.1:9", publishableKey="k", deviceToken="xpd_" + "a" * 64,
                           restaurant={"name": {"zh": "金莲小馆", "en": "Golden Lotus"}},
                           printers=[{"id": "p1", "name": "后厨 1", "host": "192.168.1.201", "port": 9100, "paperWidth": 80, "render": "text", "enabled": True}])

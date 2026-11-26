@@ -1,6 +1,6 @@
 """The setup and status window (tkinter, built into Python: nothing to install).
 
-First run: connect this computer (device key, or the owner's phone sign-in), check the printers'
+First run: connect this computer (a device key, recommended, or the owner's email sign-in), check the printers'
 IP addresses and print a test page. Afterwards it shows whether printing is working. Closing the
 window doesn't stop printing: the background service keeps going.
 """
@@ -22,6 +22,11 @@ from .printer import PrinterError
 ERRORS = {
     "invalid_key": "密钥无效、已使用或已过期，请在后台重新生成。\nThat key is wrong, used or expired: create a new one on the dashboard.",
     "invalid_code": "验证码不正确。\nThat code isn't right.",
+    "invalid_email": "请输入有效的邮箱地址。\nEnter a valid email address.",
+    "code_expired": "验证码已过期或已发送新的验证码，请重新发送。\nThat code expired or a newer one was sent: send a new code.",
+    "too_many_attempts": "验证码错误次数过多，请重新发送。\nToo many wrong codes: send a new code.",
+    "email_failed": "邮件发送失败，请检查邮箱地址，稍后再试。\nThe email couldn't be sent: check the address and try again in a minute.",
+    "cooldown": "请稍等片刻再重新发送验证码。\nPlease wait a moment before sending another code.",
     "device_revoked": "这台电脑已在后台被注销，请重新连接。\nThis computer was signed out on the dashboard: connect it again.",
     "not_authorized": "只有餐厅老板可以连接打印电脑。\nOnly the restaurant's owner can connect a printer computer.",
     "invalid_input": "请检查填写的内容（IP 地址如 192.168.1.100）。\nPlease check the fields (IP address like 192.168.1.100).",
@@ -48,7 +53,8 @@ class App:
         self.root = root
         self.results: "queue.Queue[Callable[[], None]]" = queue.Queue()
         self.session: Optional[str] = None
-        self.phone = ""
+        self.email = ""
+        self.resend_at = 0.0
         root.title(APP_TITLE)
         root.geometry("600x680")
         root.minsize(520, 560)
@@ -113,13 +119,16 @@ class App:
 
     def connect_screen(self, cfg: Dict[str, Any]) -> None:
         ttk.Label(self.body, text="连接这台电脑 Connect this computer", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(self.body, wraplength=540, text="新订单会自动从后厨小票机打印出来。请用老板账号登录，或粘贴后台生成的设备密钥。\nNew orders print by themselves on the kitchen printers. Sign in with the owner's phone, or paste a device key from the dashboard (Settings → Kitchen printers).").pack(anchor="w", pady=(4, 12))
+        ttk.Label(self.body, wraplength=540, text="新订单会自动从后厨小票机打印出来。粘贴后台生成的设备密钥即可连接，也可以用老板邮箱登录。\nNew orders print by themselves on the kitchen printers. Paste a device key from the dashboard, or sign in with the owner's email.").pack(anchor="w", pady=(4, 8))
+        tip = tk.Label(self.body, wraplength=540, justify="left", anchor="w", bg="#fbf5e8", fg="#6b5220", padx=10, pady=8,
+                       text="推荐：在后台 Settings > Kitchen printers（设置 → 后厨打印机）生成设备密钥，粘贴到这里。\nRecommended: create a device key on the dashboard in Settings > Kitchen printers, and paste it here.")
+        tip.pack(fill="x", pady=(0, 10))
         tabs = ttk.Notebook(self.body)
         tabs.pack(fill="both", expand=True)
 
         key_tab = ttk.Frame(tabs, padding=14)
-        tabs.add(key_tab, text="设备密钥 Device key")
-        ttk.Label(key_tab, wraplength=520, text="在后台 设置 → 后厨打印机 → “生成设备密钥”，复制（或用手机扫码）后粘贴到下面。\nOn the dashboard: Settings → Kitchen printers → Create device key. Copy it (or scan its QR code with a phone) and paste it below.").pack(anchor="w", pady=(0, 8))
+        tabs.add(key_tab, text="设备密钥（推荐） Device key (recommended)")
+        ttk.Label(key_tab, wraplength=520, text="在后台 设置 → 后厨打印机 → “生成设备密钥”，复制（或用手机扫码）后粘贴到下面。\nOn the dashboard: Settings > Kitchen printers > Create device key. Copy it (or scan its QR code with a phone) and paste it below.").pack(anchor="w", pady=(0, 8))
         ttk.Label(key_tab, text="设备密钥 Device key (xpk_…)").pack(anchor="w")
         key = ttk.Entry(key_tab, width=48)
         key.pack(fill="x", pady=(4, 10))
@@ -139,37 +148,57 @@ class App:
         btn.configure(command=lambda: self.bg(lambda: setup.pair_with_key(key.get()), lambda _: self.connected(), btn) if key.get().strip() else None)
         btn.pack(side="left", padx=6)
 
-        phone_tab = ttk.Frame(tabs, padding=14)
-        tabs.add(phone_tab, text="手机号登录 Phone sign-in (SMS)")
-        row = ttk.Frame(phone_tab)
-        row.pack(fill="x")
-        ttk.Label(row, text="国家/地区码 Code").grid(row=0, column=0, sticky="w")
-        ttk.Label(row, text="手机号 Mobile number").grid(row=0, column=1, sticky="w", padx=(8, 0))
-        cc = ttk.Entry(row, width=6)
-        cc.insert(0, "+1")
-        cc.grid(row=1, column=0, sticky="w")
-        number = ttk.Entry(row, width=24)
-        number.grid(row=1, column=1, sticky="we", padx=(8, 0))
-        row.columnconfigure(1, weight=1)
-        send = ttk.Button(phone_tab, text="发送验证码 Send code")
-        send.pack(anchor="w", pady=(10, 10))
-        ttk.Label(phone_tab, text="短信验证码 SMS code").pack(anchor="w")
-        code = ttk.Entry(phone_tab, width=10)
+        email_tab = ttk.Frame(tabs, padding=14)
+        tabs.add(email_tab, text="邮箱登录 Email sign-in")
+        ttk.Label(email_tab, wraplength=520, text="用老板在后台登录的邮箱，我们会发送 6 位验证码。\nUse the email the owner signs in to the dashboard with: we'll email a 6-digit code.").pack(anchor="w", pady=(0, 8))
+        ttk.Label(email_tab, text="邮箱 Email").pack(anchor="w")
+        email = ttk.Entry(email_tab, width=40)
+        email.pack(fill="x", pady=(4, 0))
+        row_s = ttk.Frame(email_tab)
+        row_s.pack(fill="x", pady=(10, 4))
+        send = ttk.Button(row_s, text="发送验证码 Send code")
+        send.pack(side="left")
+        sent = ttk.Label(email_tab, wraplength=520, foreground="#555", text="")
+        sent.pack(anchor="w")
+        ttk.Label(email_tab, text="邮箱验证码 Email code").pack(anchor="w", pady=(8, 0))
+        code = ttk.Entry(email_tab, width=10)
         code.pack(anchor="w", pady=(4, 10))
-        login = ttk.Button(phone_tab, text="登录 Sign in")
+        login = ttk.Button(email_tab, text="登录 Sign in")
         login.pack(anchor="w")
-        pick = ttk.Frame(phone_tab)
+        pick = ttk.Frame(email_tab)
         pick.pack(fill="x", pady=(14, 0))
 
+        def tick() -> None:
+            if not send.winfo_exists():
+                return
+            left = int(self.resend_at - time.time() + 0.999)
+            if left > 0:
+                send.configure(text=f"重新发送 Resend ({left}s)", state="disabled")
+                self.root.after(1000, tick)
+            else:
+                send.configure(text="重新发送 Resend code" if self.email else "发送验证码 Send code", state="normal")
+
+        def on_sent(result: Dict[str, Any]) -> None:
+            self.resend_at = time.time() + float(result.get("cooldownSeconds") or 60)
+            minutes = result.get("expiresInMinutes") or 10
+            sent.configure(text=f"验证码已发送到 {self.email}，{minutes} 分钟内有效。没收到请检查垃圾邮件文件夹。\nCode sent to {self.email} (works for {minutes} min). Not there? Check the spam or junk folder.")
+            # After bg() re-enables the button (queued right behind this callback).
+            self.root.after(50, tick)
+
         def do_send() -> None:
-            self.phone = setup.normalize_phone(cc.get(), number.get())
-            self.bg(lambda: setup.send_code(self.phone), lambda _: messagebox.showinfo(APP_TITLE, f"验证码已发送到 Code sent to {self.phone}", parent=self.root), send)
+            try:
+                self.email = setup.normalize_email(email.get())
+            except api.ApiError as e:
+                messagebox.showerror(APP_TITLE, explain(e), parent=self.root)
+                return
+            to = self.email
+            self.bg(lambda: setup.send_code(to), on_sent, send)
 
         def do_login() -> None:
-            phone = self.phone or setup.normalize_phone(cc.get(), number.get())
+            to = self.email or email.get()
 
             def work() -> List[Dict[str, Any]]:
-                self.session = setup.sign_in(phone, code.get())
+                self.session = setup.sign_in(to, code.get())
                 return setup.owned_restaurants(self.session)
 
             self.bg(work, lambda rs: self.choose_restaurant(pick, rs), login)

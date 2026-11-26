@@ -1,9 +1,10 @@
 """First-run setup, shared by the window and the tests: connect this computer, set printers, test.
 
 Connecting gives the computer a device token, by either
-  * a device key made on the dashboard (Settings → Kitchen printers → Create device key), or
-  * the owner's phone sign-in (the dashboard's SMS code): the session is used once to register
-    this computer for the chosen restaurant, then signed out. Only the device token is kept.
+  * a device key made on the dashboard (Settings → Kitchen printers → Create device key): the
+    recommended way, or
+  * the owner's email sign-in (the dashboard's 6-digit email code): the session is used once to
+    register this computer for the chosen restaurant, then signed out. Only the device token is kept.
 """
 import re
 import socket
@@ -51,20 +52,23 @@ def pair_with_key(key: str, name: Optional[str] = None) -> Dict[str, Any]:
     return _store_device(_client().pair(clean_key(key), name or computer_name()))
 
 
-def normalize_phone(country: str, number: str) -> str:
-    digits = "".join(ch for ch in number if ch.isdigit())
-    cc = "".join(ch for ch in country if ch.isdigit()) or "1"
-    if number.strip().startswith("+"):
-        return "+" + digits
-    return f"+{cc}{digits}"
+EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
-def send_code(phone: str) -> None:
-    _client().send_code(phone)
+def normalize_email(text: str) -> str:
+    """The email as typed (trimmed, lower case), or ApiError("invalid_email")."""
+    email = (text or "").strip().lower()
+    if not EMAIL.match(email) or len(email) > 254:
+        raise api.ApiError("invalid_email")
+    return email
 
 
-def sign_in(phone: str, code: str) -> str:
-    return _client().verify_code(phone, code)
+def send_code(email: str, locale: str = "zh") -> Dict[str, Any]:
+    return _client().send_code(normalize_email(email), locale)
+
+
+def sign_in(email: str, code: str) -> str:
+    return _client().verify_code(normalize_email(email), code)
 
 
 def owned_restaurants(session: str) -> List[Dict[str, Any]]:

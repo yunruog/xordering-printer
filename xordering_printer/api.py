@@ -3,8 +3,9 @@
 Every call after setup uses only the device token: print_device_poll (the restaurant, its printers
 and the tickets to print), print_device_report (printed / failed), print_device_save_printer,
 print_device_status (printer states) and print_device_preview (the sample tickets as PNG).
-Setup uses either a device key (print_device_pair) or the owner's phone sign-in (the same SMS code
-as the dashboard), which is used once to register this computer and then signed out.
+Setup uses either a device key (print_device_pair, recommended) or the owner's email sign-in (the
+same 6-digit email code as the dashboard: the ordering-auth function), which is used once to register
+this computer and then signed out. No SMS.
 """
 import json
 import socket
@@ -22,10 +23,12 @@ TIMEOUT = 15
 class ApiError(Exception):
     """The server answered with an error; `code` is XOrdering's error code (device_revoked, …)."""
 
-    def __init__(self, code: str, status: int = 0):
+    def __init__(self, code: str, status: int = 0, payload: Optional[Dict[str, Any]] = None):
         super().__init__(code)
         self.code = code
         self.status = status
+        # e.g. {"waitSeconds": 42} or {"attemptsLeft": 3} from the sign-in function.
+        self.payload = payload or {}
 
 
 class NetworkError(Exception):
@@ -55,7 +58,7 @@ def _request(method: str, url: str, body: Optional[Dict[str, Any]] = None, heade
         except ValueError:
             payload = {}
         code = str(payload.get("message") or payload.get("msg") or payload.get("error_description") or payload.get("error") or f"http_{e.code}")
-        raise ApiError(code, e.code) from None
+        raise ApiError(code, e.code, payload if isinstance(payload, dict) else None) from None
     except (urllib.error.URLError, socket.timeout, ConnectionError, TimeoutError, OSError) as e:
         raise NetworkError(str(getattr(e, "reason", e))) from None
 
@@ -91,12 +94,16 @@ class Client:
     def pair(self, key: str, name: str) -> Dict[str, Any]:
         return self.rpc("print_device_pair", {"p_key": key.strip(), "p_name": name, "p_version": VERSION})
 
-    def send_code(self, phone: str) -> None:
-        _request("POST", f"{self.url}/auth/v1/otp", {"phone": phone, "create_user": False}, self._headers())
+    def send_code(self, email: str, locale: str = "zh") -> Dict[str, Any]:
+        """Emails the owner a 6-digit sign-in code (the dashboard's: XInventory's email sign-in)."""
+        body = {"email": email.strip().lower(), "locale": "zh" if locale == "zh" else "en", "app": "printer"}
+        return _request("POST", f"{self.url}/functions/v1/ordering-auth/send", body, self._headers()) or {}
 
-    def verify_code(self, phone: str, code: str) -> str:
-        res = _request("POST", f"{self.url}/auth/v1/verify", {"type": "sms", "phone": phone, "token": code.strip()}, self._headers())
-        token = (res or {}).get("access_token")
+    def verify_code(self, email: str, code: str) -> str:
+        """The emailed code → a session (access token), used once to register this computer."""
+        body = {"email": email.strip().lower(), "code": "".join(ch for ch in code if ch.isdigit())}
+        res = _request("POST", f"{self.url}/functions/v1/ordering-auth/verify", body, self._headers())
+        token = ((res or {}).get("session") or {}).get("access_token")
         if not token:
             raise ApiError("invalid_code")
         return token

@@ -19,7 +19,7 @@ TSP143III futurePRNT raster printers (Star Graphic Mode, no fonts on board) and 
 ## 到店安装步骤（约 10 分钟）
 
 **准备：** 店里的 Windows 电脑、小票机都插好网线并开机，电脑和打印机连在同一个路由器上。
-在后台 设置 → 后厨打印机 → “生成设备密钥”（手机上也行：复制，或扫码）。不需要短信验证码。
+**推荐：** 在后台 Settings > Kitchen printers（设置 → 后厨打印机）点 “生成设备密钥”（手机上也行：复制，或扫码），粘贴到程序里。
 
 1. **（可选）查打印机的 IP 地址。** 程序里可以直接“扫描打印机”。也可以关掉打印机，按住 **FEED（走纸）**
    键再打开电源，打印机会打出自检页，上面写着 IP 地址（例如 `192.168.1.100`）。
@@ -27,7 +27,7 @@ TSP143III futurePRNT raster printers (Star Graphic Mode, no fonts on board) and 
 3. **打开程序。** 双击下载好的文件。如果出现蓝色的“Windows 已保护你的电脑”，点 **更多信息** →
    **仍要运行**。如果防火墙询问，点 **允许**。
 4. **连接这台电脑：** 把 `xpk_` 开头的设备密钥粘贴到“设备密钥”（有“粘贴”按钮，整段消息粘进来也行），
-   点“连接”。（短信开通的话，也可以用“手机号登录”。）
+   点“连接”。（也可以用“邮箱登录”：输入老板登录后台的邮箱，填入邮件里的 6 位验证码；没收到请看垃圾邮件文件夹。）
 5. **填打印机。** 点“添加”（后台已经添加的会自动显示，点“修改”核对）：填名称，点 **“扫描打印机”**，
    在找到的 IP 里点一下即可填入，并自动 **“测试连接”**：绿色“已连接”就好；红色会写原因（超时：没开机 /
    IP 不对；拒绝连接：端口不对或打印机正忙）。**打印机类型**：Star TSP100 / TSP143III 选 **“Star 光栅”**；
@@ -62,7 +62,8 @@ TSP143III futurePRNT raster printers (Star Graphic Mode, no fonts on board) and 
 1. Download `XOrderingPrinter.exe` on the shop's Windows computer and double-click it
    (SmartScreen: **More info → Run anyway**; firewall prompt: **Allow**).
 2. Connect: paste a device key from the dashboard (Settings → Kitchen printers → Create device key;
-   copy it or scan its QR code). Signing in with the owner's phone works too when SMS is set up.
+   copy it or scan its QR code): the recommended way. Or **Email sign-in**: the owner's dashboard
+   email and the 6-digit code it receives (check the spam folder if it doesn't arrive). No SMS.
 3. Add or check each printer: **Scan** lists the devices with port 9100 open (click one to use it),
    **Test connection** turns green or names the reason (timed out / refused). Type: **Star raster**
    for Star TSP100 / TSP143III, otherwise Text (GBK), or Picture when Chinese comes out garbled.
@@ -86,7 +87,7 @@ XOrdering (Supabase)  <── HTTPS, every 4 s ──  XOrderingPrinter (shop PC
 
 - **Server details** aren't in the code: the program reads the XOrdering site's
   `printer-config.json` (the server URL and the publishable key the website itself uses).
-- **Device token:** connecting (device key, or the owner's SMS sign-in, used once and signed out)
+- **Device token:** connecting (device key, or the owner's email sign-in, used once and signed out)
   gives this computer a long-lived token. Only its hash is on the server; the dashboard can sign
   the computer out. Stored in `%APPDATA%\XOrderingPrinter\config.json` with the printers, outside
   the program, so updates and reinstalls keep it.
