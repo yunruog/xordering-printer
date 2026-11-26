@@ -159,7 +159,7 @@ class StarPrinterTest(unittest.TestCase):
 class ConnectionTest(unittest.TestCase):
     def test_refused(self):
         with self.assertRaises(printer.PrinterError) as e:
-            printer.probe("127.0.0.1", free_port(), timeout=1)
+            printer.probe("127.0.0.1", free_port())
         self.assertEqual(e.exception.code, "refused")
 
     def test_timeout(self):

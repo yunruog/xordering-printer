@@ -165,8 +165,12 @@ def send(host: str, port: int, payload: bytes, *, check_status: bool = True, kin
     return status
 
 
-def probe(host: str, port: int = 9100, timeout: float = 3.0, kind: str = "escpos") -> Dict[str, object]:
-    """Test connection: {ok, ms, status} or raises PrinterError with the reason (timeout / refused / …)."""
+def probe(host: str, port: int = 9100, timeout: float = 5.0, kind: str = "escpos") -> Dict[str, object]:
+    """Test connection: {ok, ms, status} or raises PrinterError with the reason (timeout / refused / …).
+
+    Windows retries a refused connection for about 2 seconds before giving up, so the timeout must be
+    longer than that to tell "refused" (busy, wrong port) from "no answer" (off, wrong address).
+    """
     started = time.time()
     sock = _connect(host, port, timeout=timeout)
     try:
