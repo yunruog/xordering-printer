@@ -19,6 +19,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 os.environ["XORDERING_PRINTER_HOME"] = tempfile.mkdtemp(prefix="xop-screens-")
 OUT = ROOT / "e2e-output" / "screens"
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 OUT.mkdir(parents=True, exist_ok=True)
 
 import json  # noqa: E402

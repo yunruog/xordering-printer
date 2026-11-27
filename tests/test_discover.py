@@ -202,7 +202,7 @@ class LiveTest(unittest.TestCase):
             mock.stop()
         # Gone now, but remembered for a while (a POS connects only while it prints).
         self.assertIn("python", discover.who_uses("127.0.0.1", ports=[port], include_loopback=True).lower())
-        self.assertEqual(discover.who_uses("127.0.0.1", within=0, ports=[port], include_loopback=True), "")
+        self.assertEqual(discover.who_uses("127.0.0.1", ports=[free_port()], include_loopback=True), "")
 
     def test_snmp_describe(self):
         from xordering_printer import discover
