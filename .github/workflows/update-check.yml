@@ -1,0 +1,50 @@
+# Checks that an installed older version updates itself to the latest release and keeps its
+# settings: the device token, the printers and this computer's printer connections (printerLocal).
+# Run it after publishing a release: Actions → Update check → Run workflow (from: the old version).
+name: Update check
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Installed version to start from"
+        default: "v0.2.2"
+jobs:
+  update:
+    runs-on: windows-latest
+    steps:
+      - name: Old version, with settings, updating itself
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $latest = (gh release view --repo $env:GITHUB_REPOSITORY --json tagName | ConvertFrom-Json).tagName
+          "from ${{ inputs.from }} to $latest"
+          $dir = Join-Path $env:RUNNER_TEMP "app"; New-Item -ItemType Directory $dir | Out-Null
+          gh release download "${{ inputs.from }}" --repo $env:GITHUB_REPOSITORY --pattern XOrderingPrinter.exe --dir $dir
+          $env:XORDERING_PRINTER_HOME = Join-Path $env:RUNNER_TEMP "data"
+          $env:XORDERING_PRINTER_PORT = "47491"
+          New-Item -ItemType Directory $env:XORDERING_PRINTER_HOME | Out-Null
+          $token = "xpd_" + ("e" * 64)
+          $cfg = @{ site = "https://yunruog.github.io/xordering/"; supabaseUrl = "http://127.0.0.1:9"; publishableKey = "k"; deviceToken = $token;
+                    deviceId = "d1"; deviceName = "PC"; restaurant = @{ id = "r1"; name = @{ en = "Tsunami Sushi" } };
+                    printers = @(@{ id = "p1"; name = "Kitchen"; host = "192.168.1.50"; port = 9100; render = "star"; paperWidth = 80; enabled = $true });
+                    printerLocal = @{ p1 = @{ connection = "windows"; windowsPrinter = "Star TSP143IIIU" } }; pollSeconds = 4; autoUpdate = $true }
+          $cfg | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $env:XORDERING_PRINTER_HOME "config.json") -Encoding utf8
+          $p = Start-Process -FilePath (Join-Path $dir "XOrderingPrinter.exe") -ArgumentList "--service" -PassThru
+          $status = Join-Path $env:XORDERING_PRINTER_HOME "status.json"
+          $want = $latest.TrimStart("v"); $deadline = (Get-Date).AddMinutes(5); $v = ""
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep 5
+            try { $v = (Get-Content $status -Raw | ConvertFrom-Json).version } catch { }
+            if ($v -eq $want) { break }
+          }
+          Get-ChildItem -Recurse (Join-Path $env:XORDERING_PRINTER_HOME "logs") | ForEach-Object { Get-Content $_.FullName -Tail 40 }
+          if ($v -ne $want) { throw "still running $v, expected $want" }
+          "now running $v"
+          $after = Get-Content (Join-Path $env:XORDERING_PRINTER_HOME "config.json") -Raw | ConvertFrom-Json
+          if ($after.deviceToken -ne $token) { throw "device token lost" }
+          if ($after.printers[0].id -ne "p1") { throw "printers lost" }
+          if ($after.printerLocal.p1.windowsPrinter -ne "Star TSP143IIIU") { throw "printer connection lost" }
+          "settings kept: token, printers, printerLocal"
+          & (Join-Path $dir "XOrderingPrinter.exe") --version
+          Get-Process XOrderingPrinter -ErrorAction SilentlyContinue | Stop-Process -Force

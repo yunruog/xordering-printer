@@ -630,7 +630,8 @@ def usb_devices() -> List[Dict[str, str]]:
     for r in rows:
         dev_id = str(r.get("PNPDeviceID") or "")
         name = str(r.get("Name") or "")
-        if not dev_id.upper().startswith(("USB", "USBPRINT", "SWD\\PRINTENUM")) and not re.search(r"VID_0519|VID_04B8", dev_id, re.I):
+        # Real USB devices only: SWD\PRINTENUM\… are Windows' own print queues (listed as Windows printers).
+        if not dev_id.upper().startswith(("USB\\", "USBPRINT\\")):
             continue
         vendor = next((v for k, v in USB_VENDORS.items() if k in dev_id.upper()), brand(name))
         out.append({"name": name, "id": dev_id, "status": str(r.get("Status") or ""), "class": str(r.get("PNPClass") or ""), "vendor": vendor})

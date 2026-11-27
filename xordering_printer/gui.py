@@ -59,8 +59,9 @@ class App:
         self.email = ""
         self.resend_at = 0.0
         root.title(APP_TITLE)
-        root.geometry("600x680")
-        root.minsize(520, 560)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{min(680, sw - 40)}x{min(760, sh - 80)}")
+        root.minsize(min(560, sw - 40), min(600, sh - 80))
         if IS_WINDOWS:
             root.option_add("*Font", ("Microsoft YaHei UI", 10))
         style = ttk.Style()
@@ -256,7 +257,7 @@ class App:
         self.queue_label.pack(anchor="w")
         # A printer that keeps failing: a red warning with the fix.
         self.alert = tk.Frame(self.body, bg="#fde8e6", padx=10, pady=8)
-        self.alert_text = tk.Label(self.alert, bg="#fde8e6", fg="#8c1d18", justify="left", anchor="w", wraplength=440, font=("Microsoft YaHei UI" if IS_WINDOWS else "TkDefaultFont", 10, "bold"))
+        self.alert_text = tk.Label(self.alert, bg="#fde8e6", fg="#8c1d18", justify="left", anchor="w", wraplength=500, font=("Microsoft YaHei UI" if IS_WINDOWS else "TkDefaultFont", 10, "bold"))
         self.alert_text.pack(side="left", fill="x", expand=True)
         self.alert_btn = ttk.Button(self.alert, text="修复 Fix", command=self.fix_stuck)
         self.alert_btn.pack(side="right")
@@ -267,7 +268,7 @@ class App:
         cols = ("name", "host", "paper", "mode", "state")
         self.status_cols = cols
         self.tree = ttk.Treeview(box, columns=cols, show="headings", height=6, selectmode="browse")
-        for c, title, w in zip(cols, ("名称 Name", "连接 Connection", "纸宽 Paper", "类型 Type", "状态 Status"), (100, 150, 55, 100, 150)):
+        for c, title, w in zip(cols, ("名称 Name", "连接 Connection", "纸宽 Paper", "类型 Type", "状态 Status"), (100, 150, 70, 110, 170)):
             self.tree.heading(c, text=title)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="both", expand=True)
@@ -532,7 +533,7 @@ class PrinterDialog:
         self.bar.grid(row=1, column=0, sticky="we", pady=(4, 6))
         cols = ("printer", "address", "source")
         self.found = ttk.Treeview(r, columns=cols, show="headings", height=8, selectmode="browse")
-        for c, title, w in zip(cols, ("打印机 Printer", "地址 Address", "来源 Found as"), (200, 120, 200)):
+        for c, title, w in zip(cols, ("打印机 Printer", "地址 Address", "来源 Found as"), (170, 120, 280)):
             self.found.heading(c, text=title)
             self.found.column(c, width=w, anchor="w")
         self.found.tag_configure("best", background="#e9f6ec")
