@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import time
 
-from . import api, config, deliver, discover, escpos, render, ticket
+from . import api, config, deliver, discover, escpos, pipeline, render, ticket
 from .logs import get as get_log
 from .printer import PrinterError, probe
 
@@ -139,7 +139,7 @@ def _kind(printer: Dict[str, Any]) -> str:
 def test_print(printer: Dict[str, Any]) -> Dict[str, Any]:
     """Prints the test page (the sample order, ASAP and scheduled) the way this computer reaches the printer."""
     cfg = config.load()
-    st = deliver.deliver(printer, ticket.test_tickets(cfg.get("restaurant")), title="XOrdering test page")
+    st = pipeline.print_tickets(printer, ticket.test_tickets(cfg.get("restaurant")), source="test page", title="XOrdering test page")
     _remember_fallback(printer, st)
     get_log().info("test page sent to %s (%s)", printer.get("name"), deliver.describe(printer))
     return st
@@ -158,10 +158,44 @@ def test_connection(printer: Dict[str, Any]) -> Dict[str, Any]:
     """
     cfg = config.load()
     started = time.time()
-    st = deliver.deliver(printer, [ticket.test_lines(printer, cfg.get("restaurant"))], title="XOrdering connection test")
+    st = pipeline.print_tickets(printer, [ticket.test_lines(printer, cfg.get("restaurant"))], source="connection test", title="XOrdering connection test")
     _remember_fallback(printer, st)
     get_log().info("connection test printed on %s (%s, %s)", printer.get("name"), deliver.describe(printer), st.get("method"))
     return {"ok": True, "ms": int((time.time() - started) * 1000), "method": st.get("method"), "status": st, "fallback": st.get("fallback")}
+
+
+def reprint_last(printer: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """"Reprint last order": the newest order ticket this computer received, printed again (marked
+    REPRINT) on `printer`, or on the printer it was for. Same pipeline as everything else; nothing
+    is ordered or sent to the server. Raises LookupError when no order has come in yet."""
+    from .jobs import JobStore
+    from .paths import jobs_db_path
+
+    store = JobStore(str(jobs_db_path()))
+    try:
+        job = store.last_order()
+    finally:
+        store.close()
+    if not job:
+        raise LookupError("no order yet")
+    cfg = config.load()
+    printers = {p["id"]: p for p in config.effective_printers(cfg)}
+    target = printer or printers.get(job.get("printerId"))
+    if not target:
+        raise LookupError("printer gone")
+    order = job["order"]
+    st = pipeline.print_tickets(target, [ticket.build(order, cfg.get("restaurant") or {}, reason="reprint")], source="reprint (window)", job_id=job.get("id") or "",
+                                order=order, title=f"XOrdering #{order.get('number')} reprint")
+    _remember_fallback(target, st)
+    get_log().info("order #%s reprinted on %s from the window", order.get("number"), target.get("name"))
+    return dict(st, order=order.get("number"), printer=target.get("name"))
+
+
+def set_paused(paused: bool, skip_waiting: bool = False) -> Dict[str, Any]:
+    """The window's "Pause printing" switch: takes effect here at once (the worker reads config.json),
+    and reaches the server (and the dashboard) with the worker's next poll."""
+    get_log().info("printing %s in the window%s", "paused" if paused else "resumed", " (waiting tickets skipped)" if skip_waiting else "")
+    return config.update(paused=paused, pausePending={"paused": paused, "skip": bool(skip_waiting and not paused), "at": time.time()})
 
 
 def check_connection(host: str, port: int = 9100, render_kind: str = "text") -> Dict[str, Any]:

@@ -185,7 +185,18 @@ def render(lines: List[Line], paper_width: int = 80):
                         rx = dots - MARGIN - (8 if line.invert else 0) - f.getlength(right)
                         draw.text((rx + dx, ty), right, font=f, fill=ink)
         y += h
-    return img.point(lambda v: 0 if v < THRESHOLD else 255, mode="1")
+    return trim_bottom(img.point(lambda v: 0 if v < THRESHOLD else 255, mode="1"))
+
+
+def trim_bottom(img, keep: int = 4):
+    """Cuts the blank rows under the last ink (no paper fed for nothing before the cut)."""
+    from PIL import ImageOps
+
+    box = ImageOps.invert(img.convert("L")).getbbox()
+    if not box:
+        return img
+    bottom = min(img.size[1], box[3] + keep)
+    return img.crop((0, 0, img.size[0], bottom)) if bottom < img.size[1] else img
 
 
 def render_many(tickets: List[List[Line]], paper_width: int = 80) -> list:

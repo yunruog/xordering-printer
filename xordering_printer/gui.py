@@ -255,6 +255,18 @@ class App:
         self.status_label.pack(anchor="w", pady=(6, 2))
         self.queue_label = ttk.Label(self.body, foreground="#555")
         self.queue_label.pack(anchor="w")
+        actions = ttk.Frame(self.body)
+        actions.pack(fill="x", pady=(8, 0))
+        self.pause_btn = ttk.Button(actions, text="⏸ 暂停打印 Pause printing", command=self.toggle_pause)
+        self.pause_btn.pack(side="left")
+        self.reprint_btn = ttk.Button(actions, text="重打最近一单 Reprint last order", command=self.reprint_last)
+        self.reprint_btn.pack(side="left", padx=6)
+        self.actions = actions
+        # Paused: an amber band; tickets refused by the check or given up: a red one.
+        self.paused_band = tk.Label(self.body, bg="#fbf1dc", fg="#6b4a00", justify="left", anchor="w", padx=10, pady=6, wraplength=540)
+        self.paused_shown = False
+        self.problem_band = tk.Label(self.body, bg="#fde8e6", fg="#8c1d18", justify="left", anchor="w", padx=10, pady=6, wraplength=540)
+        self.problem_shown = False
         # A printer that keeps failing: a red warning with the fix.
         self.alert = tk.Frame(self.body, bg="#fde8e6", padx=10, pady=8)
         self.alert_text = tk.Label(self.alert, bg="#fde8e6", fg="#8c1d18", justify="left", anchor="w", wraplength=500, font=("Microsoft YaHei UI" if IS_WINDOWS else "TkDefaultFont", 10, "bold"))
@@ -290,6 +302,8 @@ class App:
         foot = ttk.Frame(self.body)
         foot.pack(fill="x", pady=(6, 0))
         ttk.Button(foot, text="打开日志 Logs", command=self.open_logs).pack(side="left")
+        self.copy_btn = ttk.Button(foot, text="复制日志 Copy log", command=self.copy_log)
+        self.copy_btn.pack(side="left", padx=(6, 0))
         ttk.Button(foot, text="诊断报告 Diagnostics", command=lambda: ReportWindow(self, self.root, None)).pack(side="left", padx=(6, 0))
         ttk.Button(foot, text="断开此电脑 Disconnect", command=self.disconnect).pack(side="left", padx=6)
         ttk.Label(self.body, wraplength=540, foreground="#777", text=f"关闭此窗口后打印会在后台继续，开机自动运行。Printing continues in the background after you close this window, and starts with Windows.   v{VERSION}").pack(anchor="w", pady=(10, 0))
@@ -321,6 +335,8 @@ class App:
         self.status_label.configure(text=text, foreground=color)
         q = st.get("queue") or {}
         self.queue_label.configure(text=f"待打印 Waiting: {q.get('queued', 0)}   ·   已打印 Printed (14 days): {q.get('printed', 0)}")
+        self.show_pause(bool(cfg.get("paused")), int(q.get("queued", 0) or 0))
+        self.show_problems((st.get("problems") or []) if fresh else [], cfg)
         if state == "stopped":
             from .install import ensure_running
 
@@ -342,6 +358,80 @@ class App:
                 self.tree.selection_set(iid)
         if not self.tree.selection() and self.tree.get_children():
             self.tree.selection_set(self.tree.get_children()[0])
+
+    def show_pause(self, paused: bool, waiting: int) -> None:
+        self.pause_btn.configure(text="▶ 恢复打印 Resume printing" if paused else "⏸ 暂停打印 Pause printing")
+        if paused:
+            self.paused_band.configure(text=f"⏸ 打印已暂停：新订单进入队列，不会打印（{waiting} 张在排队）。点“恢复打印”后可选择补打或跳过。\n"
+                                            f"Printing is paused: new tickets wait ({waiting} waiting). Resume to print them or skip them.")
+            if not self.paused_shown:
+                self.paused_band.pack(fill="x", pady=(8, 0), after=self.actions)
+                self.paused_shown = True
+        elif self.paused_shown:
+            self.paused_band.pack_forget()
+            self.paused_shown = False
+
+    def show_problems(self, problems: List[Dict[str, Any]], cfg: Dict[str, Any]) -> None:
+        if not problems:
+            if self.problem_shown:
+                self.problem_band.pack_forget()
+                self.problem_shown = False
+            return
+        names = {p["id"]: p.get("name") for p in config.effective_printers(cfg)}
+        lines = [f"✕ 订单 #{p.get('order_number') or '?'} 没有打印 not printed ({names.get(p.get('printer_id'), '')}): {(p.get('last_error') or '')[:220]}" for p in problems[:3]]
+        self.problem_band.configure(text="\n".join(lines) + "\n改好设置后可点“重打最近一单”，或在后台重打。Fix the setting, then Reprint last order (or reprint on the dashboard).")
+        if not self.problem_shown:
+            self.problem_band.pack(fill="x", pady=(8, 0), after=self.actions)
+            self.problem_shown = True
+
+    def toggle_pause(self) -> None:
+        cfg = config.load()
+        if not cfg.get("paused"):
+            if messagebox.askyesno(APP_TITLE, "暂停打印？新订单会进入队列，不会打印，直到恢复。后台也会显示已暂停。\nPause printing? New tickets wait in the queue until you resume (the dashboard shows it too).", parent=self.root):
+                setup.set_paused(True)
+                self.update_status()
+            return
+        try:
+            waiting = int((json.loads(status_path().read_text("utf-8")).get("queue") or {}).get("queued", 0))
+        except (OSError, ValueError):
+            waiting = 0
+        skip = False
+        if waiting:
+            answer = messagebox.askyesnocancel(APP_TITLE, f"暂停期间有 {waiting} 张小票在排队。\n要补打吗？\n\n是 = 补打  ·  否 = 跳过不打  ·  取消 = 继续暂停\n\n"
+                                                          f"{waiting} ticket(s) waited during the pause. Print them?\nYes = print them · No = skip them · Cancel = stay paused", parent=self.root)
+            if answer is None:
+                return
+            skip = not answer
+        setup.set_paused(False, skip_waiting=skip)
+        self.update_status()
+
+    def reprint_last(self) -> None:
+        p = self.selected_printer()
+
+        def done(st: Dict[str, Any]) -> None:
+            messagebox.showinfo(APP_TITLE, f"已重打订单 #{st.get('order')} 到 {st.get('printer')}。\nOrder #{st.get('order')} reprinted on {st.get('printer')}.", parent=self.root)
+
+        def failed(e: BaseException) -> None:
+            if isinstance(e, LookupError):
+                messagebox.showinfo(APP_TITLE, "这台电脑还没有收到过订单。\nNo order has come in on this computer yet.", parent=self.root)
+                return
+            text = explain_printer_error(e) if isinstance(e, PrinterError) else explain(e)
+            messagebox.showerror(APP_TITLE, f"没有重打 Not reprinted:\n\n{text}", parent=self.root)
+
+        self.bg(lambda: setup.reprint_last(p), done, self.reprint_btn, error=failed)
+
+    def copy_log(self) -> None:
+        from . import pipeline
+
+        try:
+            st = json.loads(status_path().read_text("utf-8"))
+        except (OSError, ValueError):
+            st = {}
+        text = pipeline.copy_text(config.load(), st)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.copy_btn.configure(text="已复制 Copied ✓")
+        self.root.after(2500, lambda: self.copy_btn.winfo_exists() and self.copy_btn.configure(text="复制日志 Copy log"))
 
     def show_alert(self, printers: List[Dict[str, Any]], state: Dict[str, Any], queue: Dict[str, Any]) -> None:
         stuck = [(p, state[p["id"]]) for p in printers if p.get("enabled", True) and (state.get(p["id"]) or {}).get("stuck")]
@@ -380,7 +470,9 @@ class App:
         printer = None if new else self.selected_printer()
         if printer is None:
             n = len(cfg.get("printers") or []) + 1
-            printer = {"name": f"后厨 Kitchen {n}", "host": "", "port": 9100, "paperWidth": 80, "render": "star", "enabled": True,
+            # ESC/POS picture by default: on a Star TSP100 it prints nothing (no paper lost), while Star
+            # raster on an ESC/POS printer prints metres of garbage. Star is chosen when found as Star.
+            printer = {"name": f"后厨 Kitchen {n}", "host": "", "port": 9100, "paperWidth": 80, "render": "image", "enabled": True,
                        "connection": "windows" if IS_WINDOWS else "tcp"}
         self.open_dialog(printer)
 
@@ -499,7 +591,7 @@ class PrinterDialog:
         self.port.pack(anchor="w", pady=(2, 0))
 
         ttk.Label(f, text="打印机类型 Printer type").pack(anchor="w")
-        self.render = tk.StringVar(value=printer.get("render", "star"))
+        self.render = tk.StringVar(value=printer.get("render", "image"))
         for value, label in (("star", "Star 光栅 (TSP100III / TSP143)"), ("image", "ESC/POS 图片 Picture"), ("text", "ESC/POS 文字 Text (GBK)")):
             ttk.Radiobutton(f, text=label, value=value, variable=self.render, command=self.sync_paper).pack(anchor="w")
         ttk.Label(f, text="纸宽 Paper width").pack(anchor="w", pady=(6, 0))
@@ -758,6 +850,7 @@ class PrinterDialog:
             self.result.configure(text="请先选择 Windows 打印机。Choose the Windows printer first.", fg="#b3261e")
             return
         self.result.configure(text="正在打印测试小票… Printing a test ticket…", fg="#555")
+        self.tested_render = p["render"]
         run_probe(self.app, p, self.result, self.probe_btn)
 
     def save(self) -> None:
@@ -768,6 +861,21 @@ class PrinterDialog:
         if p["connection"] == "windows" and not p["windowsPrinter"]:
             self.result.configure(text="请先选择 Windows 打印机。Choose the Windows printer first.", fg="#b3261e")
             return
+        from . import pipeline
+
+        driver = (self.win_printer_info(p["windowsPrinter"]) or {}).get("driver", "") if p["connection"] == "windows" else ""
+        conflict = pipeline.type_conflict(p, driver)
+        if conflict:
+            self.result.configure(text=conflict, fg="#b3261e")
+            return
+        tested = getattr(self, "tested_render", None)
+        changed = not self.is_new and (self.printer.get("render") or p["render"]) != p["render"]
+        if (tested and tested != p["render"]) or (changed and tested != p["render"]):
+            names = {"star": "Star 光栅 Star raster", "image": "ESC/POS 图片 picture", "text": "ESC/POS 文字 text"}
+            was = names.get(tested or self.printer.get("render") or "", "")
+            if not messagebox.askyesno(APP_TITLE, f"打印机类型改成了“{names.get(p['render'], '')}”，测试时用的是“{was}”。\n类型不对会打出一长串乱码、浪费纸。建议先点“测试连接”确认能正常打印。仍要保存吗？\n\n"
+                                                  f"The type is now {names.get(p['render'], '')} but it was tested as {was}. The wrong type prints a long strip of garbage. Press Test connection first. Save anyway?", parent=self.top):
+                return
 
         def done(saved: Dict[str, Any]) -> None:
             self.top.destroy()

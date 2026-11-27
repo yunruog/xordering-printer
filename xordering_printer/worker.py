@@ -12,6 +12,11 @@ in with the next successful poll. Printer offline: tickets wait in jobs.db. Neit
 Each printer is reached the way this computer was set up for it (deliver.py: straight to IP:9100,
 or through a Windows printer). A printer shared with the POS (qMenu …) refuses us while the POS
 holds it: the error names that program, the ticket waits and is retried (2 s, 5 s, 10 s … 30 s).
+Every ticket goes through pipeline.print_tickets() (the same build, check, send and log as the test
+page). A ticket that fails the check is never sent; one that may have partly printed is tried at most
+jobs.MAX_TRIES times. A second "new" ticket for an order already printed on that printer is skipped.
+Paused (this window or the dashboard): tickets wait; on resume they print, or are skipped.
+
 A printer that keeps failing for STUCK_AFTER seconds is flagged `stuck` (the window shows a red
 warning and suggests Windows printer mode) and the printers are looked for again in the background
 (discovery.json), once per REDISCOVER_EVERY. Every CONNECTION_SAMPLE seconds the worker notes which
@@ -24,9 +29,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import threading
 
-from . import VERSION, api, config, discover, escpos, render, ticket
-from .deliver import deliver
-from .jobs import JobStore
+from . import VERSION, api, config, discover, escpos, pipeline, render, ticket
+from .jobs import MAX_TRIES, JobStore
 from .logs import get as get_log
 from .paths import data_dir, jobs_db_path, status_path
 from .printer import PrinterError, send
@@ -36,6 +40,9 @@ STUCK_AFTER = 180.0
 STUCK_ATTEMPTS = 3
 REDISCOVER_EVERY = 1800.0
 CONNECTION_SAMPLE = 15.0
+# Failures after which part of the ticket may have printed: these use up one of the job's MAX_TRIES.
+# The others (printer off, busy, in use by the POS, out of paper before it started) only wait.
+MAYBE_PRINTED = ("partial", "lost", "driver")
 
 
 def describe_printer(printer: Dict[str, Any]) -> str:
@@ -111,6 +118,8 @@ class Worker:
             return
         client = self.client_factory(self.cfg)
         online = self.poll(client, token)
+        if not online:
+            self.sync_pause(None, token, None)
         if self.state == "revoked":
             return
         self.print_due()
@@ -154,6 +163,7 @@ class Worker:
             changes["deviceName"] = device["name"]
         if changes:
             self._save(**changes)
+        self.sync_pause(client, token, res.get("paused") if "paused" in res else None)
         preview = res.get("previewRequestedAt")
         if preview and preview != self.preview_done:
             self.preview_done = preview
@@ -179,6 +189,8 @@ class Worker:
         return True
 
     def print_due(self) -> None:
+        if self.cfg.get("paused"):
+            return  # tickets wait in jobs.db until printing is resumed
         printers = self.printers()
         restaurant = self.cfg.get("restaurant") or {}
         down = set()
@@ -192,19 +204,33 @@ class Worker:
             job = json.loads(row["payload"])
             order = job.get("order") or {}
             reason = job.get("reason") or "new"
+            if reason == "new" and self.store.printed_order(order.get("id"), pid, row["id"]):
+                self.store.skip(row["id"], "duplicate: this order already printed on this printer")
+                self.log.warning("order #%s already printed on %s: second ticket %s skipped (use Reprint to print it again)", order.get("number"), printer.get("name"), row["id"])
+                continue
             try:
                 tickets = self.ticket_lines(job, printer, restaurant)
-                status = deliver(printer, tickets, sender=self.send, who_uses=self.who_uses, title=f"XOrdering #{order.get('number') or 'test'}")
+                status = pipeline.print_tickets(printer, tickets, source="order" if order else "test (dashboard)", job_id=row["id"], order=order,
+                                                attempt=int(row["attempts"]) + 1, sender=self.send, who_uses=self.who_uses,
+                                                title=f"XOrdering #{order.get('number') or 'test'}")
+            except pipeline.BadTicket as e:
+                self.store.give_up(row["id"], f"not sent: {e}")
+                self.log.error("order #%s NOT sent to %s: %s", order.get("number"), printer.get("name"), e)
+                self.printer_state[pid] = dict(self.printer_state.get(pid) or {}, ok=False, error=str(e), code="bad_ticket", at=time.time(), stuck=False)
+                continue
             except PrinterError as e:
-                attempts = self.store.mark_failed(row["id"], str(e))
+                maybe = e.code in MAYBE_PRINTED
+                attempts = self.store.mark_failed(row["id"], str(e), maybe_printed=maybe)
                 down.add(pid)
                 if self.printer_state.get(pid, {}).get("ok", True) or attempts == 1:
                     self.log.warning("printer %s (%s): %s; order #%s waits (attempt %s)", printer.get("name"), describe_printer(printer), e, order.get("number"), attempts)
+                if (self.store.get(row["id"]) or {"state": ""})["state"] == "failed":
+                    self.log.error("order #%s on %s given up after %s tries (part of it may have printed): reprint it by hand", order.get("number"), printer.get("name"), MAX_TRIES)
                 self.printer_failed(pid, printer, e)
                 continue
             except Exception as e:  # a ticket that can't be laid out must not stop the others
                 self.log.exception("ticket for order #%s failed", order.get("number"))
-                self.store.mark_failed(row["id"], f"ticket error: {e}")
+                self.store.give_up(row["id"], f"ticket error: {e}")
                 continue
             self.store.mark_printed(row["id"])
             if (status or {}).get("fallback") and printer.get("windowsMethod") != "driver":
@@ -229,7 +255,35 @@ class Worker:
 
     @classmethod
     def ticket_payload(cls, job: Dict[str, Any], printer: Dict[str, Any], restaurant: Dict[str, Any]) -> bytes:
-        return escpos.tickets_bytes(cls.ticket_lines(job, printer, restaurant), printer)
+        return pipeline.build(printer, cls.ticket_lines(job, printer, restaurant))
+
+    # --- pause -------------------------------------------------------------------------------
+
+    def sync_pause(self, client: Optional[api.Client], token: str, server_paused: Optional[bool]) -> None:
+        """One pause for the restaurant: the window's switch (pausePending, pushed to the server)
+        or the dashboard's (server_paused). Resuming with skip skips the tickets that waited."""
+        pending = self.cfg.get("pausePending")
+        if isinstance(pending, dict):
+            if pending.get("skip") and not pending.get("skippedHere"):
+                n = self.store.skip_queued(float(pending.get("at") or time.time()))
+                self.log.info("printing resumed; %s waiting ticket(s) skipped", n)
+                pending = dict(pending, skippedHere=True)
+                self._save(pausePending=pending)
+            if client is None:
+                return
+            try:
+                client.set_paused(token, bool(pending.get("paused")), bool(pending.get("skip")))
+            except api.ApiError as e:
+                self.log.warning("pause not sent to the server: %s", e.code)
+                if e.code not in ("invalid_input",) and "function" not in e.code:
+                    return
+            except api.NetworkError:
+                return
+            self._save(pausePending=None)
+            return
+        if server_paused is not None and bool(server_paused) != bool(self.cfg.get("paused")):
+            self.log.info("printing %s on the dashboard", "paused" if server_paused else "resumed")
+            self._save(paused=bool(server_paused))
 
     # --- printers that keep failing --------------------------------------------------------
 
@@ -301,12 +355,13 @@ class Worker:
         printers = {}
         for pid, st in self.printer_state.items():
             printers[pid] = {"ok": bool(st.get("ok")), "error": st.get("error"), "code": st.get("code"), "paperLow": bool(st.get("paperLow")), "stuck": bool(st.get("stuck"))}
-        return {"version": VERSION, "printers": printers, "queue": self.store.counts()}
+        problems = [{"order": r["order_number"], "printerId": r["printer_id"], "error": (r["last_error"] or "")[:200]} for r in self.store.problems(time.time() - 86400)[:3]]
+        return {"version": VERSION, "printers": printers, "queue": self.store.counts(), "paused": bool(self.cfg.get("paused")), "problems": problems}
 
     def send_status(self, client: api.Client, token: str) -> None:
         """Printer states (paper out, cover open, …) for the dashboard: on a change, else every minute."""
         st = self.status_payload()
-        key = json.dumps({"printers": st["printers"], "queued": st["queue"].get("queued")}, sort_keys=True)
+        key = json.dumps({"printers": st["printers"], "queued": st["queue"].get("queued"), "paused": st["paused"], "problems": st["problems"]}, sort_keys=True)
         if key == self.status_sent and time.time() - self.status_sent_at < 60:
             return
         try:
@@ -325,6 +380,13 @@ class Worker:
                     client.report(token, row["id"], "printed")
                 except api.ApiError as e:
                     if e.code not in ("not_found",):
+                        raise
+                self.store.mark_reported(row["id"])
+            for row in self.store.unreported_skipped():
+                try:
+                    client.report(token, row["id"], "skipped", row["last_error"])
+                except api.ApiError as e:
+                    if e.code not in ("not_found", "invalid_input"):
                         raise
                 self.store.mark_reported(row["id"])
             for row in self.store.failures_to_report():
@@ -351,6 +413,8 @@ class Worker:
             "lastError": self.last_error,
             "printers": self.printer_state,
             "queue": self.store.counts(),
+            "paused": bool(self.cfg.get("paused")),
+            "problems": [dict(r) for r in self.store.problems(time.time() - 86400)],
             "rediscovery": {"running": self.rediscovering, "at": self.rediscovered_at or None},
         }
         tmp = str(status_path()) + ".tmp"

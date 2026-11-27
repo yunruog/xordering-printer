@@ -10,7 +10,10 @@
                     address, type and paper; these stay here, so a poll never overwrites them):
                     {connection: tcp | windows, windowsPrinter, windowsMethod: raw | driver}
     pollSeconds     how often to ask for new tickets (3-5)
-    autoUpdate      check GitHub Releases once a day
+    autoUpdate      check GitHub Releases for updates
+    paused          printing paused (this window's switch or the dashboard's): tickets wait
+    pausePending    a pause / resume made in this window, not yet sent to the server:
+                    {paused, skip, at} (skip: resume without printing what waited since `at`)
 """
 import json
 import os
@@ -33,6 +36,8 @@ DEFAULTS: Dict[str, Any] = {
     "printerLocal": {},
     "pollSeconds": 4,
     "autoUpdate": True,
+    "paused": False,
+    "pausePending": None,
 }
 
 

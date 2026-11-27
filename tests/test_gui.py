@@ -96,6 +96,55 @@ class GuiTest(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_pause_reprint_copy_log_and_type_guard(self):
+        temp_home()
+        import json
+        import time
+        import tkinter as tk
+        from unittest import mock
+
+        from xordering_printer import config, gui, install, paths
+
+        install.ensure_running = lambda: None
+        printer = {"id": "p1", "name": "后厨 Kitchen 1", "host": "POS-G2", "port": 9100, "paperWidth": 80, "render": "image", "enabled": True}
+        config.update(supabaseUrl="http://127.0.0.1:9", publishableKey="k", deviceToken="xpd_" + "a" * 64, restaurant={"name": {"en": "Tsunami Sushi"}},
+                      printers=[printer], printerLocal={"p1": {"connection": "windows", "windowsPrinter": "Kitchen"}}, paused=True)
+        paths.status_path().write_text(json.dumps({"updatedAt": time.time(), "state": "ok", "queue": {"queued": 2, "printed": 1},
+                                                   "problems": [{"order_number": 1003, "printer_id": "p1", "last_error": "not sent: Star raster to an ESC/POS driver"}]}), "utf-8")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = gui.App(root)
+            root.update()
+            self.assertIn("恢复打印", app.pause_btn.cget("text"))
+            self.assertTrue(app.paused_shown and app.problem_shown)
+            self.assertIn("#1003", app.problem_band.cget("text"))
+            app.copy_log()
+            self.assertIn("type=image paper=80mm connection=windows target=Kitchen", root.clipboard_get())
+            self.assertNotIn("xpd_" + "a" * 64, root.clipboard_get())
+            with mock.patch.object(gui.messagebox, "askyesnocancel", return_value=False):
+                app.toggle_pause()  # resume, skip the 2 waiting
+            cfg = config.load()
+            self.assertFalse(cfg["paused"])
+            self.assertEqual((cfg["pausePending"]["paused"], cfg["pausePending"]["skip"]), (False, True))
+            # Saving a type that wasn't tested asks first; Star raster to an ESC/POS driver isn't saved at all.
+            d = gui.PrinterDialog(app, config.effective_printers(config.load())[0], autodetect=False)
+            d.win_printers = [{"name": "Kitchen", "driver": "POS-80C", "port": "USB001", "ip": "", "tcpPort": None}]
+            d.render.set("star")
+            with mock.patch.object(gui.setup, "save_printer") as save:
+                d.save()
+                root.update()
+                save.assert_not_called()
+            self.assertIn("ESC/POS", d.result.cget("text"))
+            d.render.set("text")
+            with mock.patch.object(gui.messagebox, "askyesno", return_value=False) as ask, mock.patch.object(gui.setup, "save_printer") as save:
+                d.save()
+                self.assertTrue(ask.called)
+                save.assert_not_called()
+            d.top.destroy()
+        finally:
+            root.destroy()
+
 
 def setup_report(res):
     from xordering_printer import setup

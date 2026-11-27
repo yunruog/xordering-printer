@@ -1,4 +1,4 @@
-"""Self-update from this repository's GitHub Releases (public, no sign-in), checked once a day.
+"""Self-update from this repository's GitHub Releases (public, no sign-in), checked every 3 hours.
 
 The worker downloads a newer XOrderingPrinter.exe next to the data folder and checks it against the
 release's XOrderingPrinter.exe.sha256, then exits with UPDATE_EXIT_CODE. The service (which runs
@@ -21,7 +21,7 @@ from .logs import get as get_log
 from .paths import FROZEN, IS_WINDOWS, updates_dir
 
 ASSET = f"{APP_NAME}.exe"
-CHECK_EVERY = 24 * 3600
+CHECK_EVERY = 3 * 3600  # fixes reach the restaurants within hours (GitHub allows 60 checks an hour)
 
 
 def parse_version(v: str) -> Tuple[int, ...]:

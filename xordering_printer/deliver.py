@@ -74,10 +74,15 @@ def pictures(tickets: List[List[Line]], printer: Dict[str, Any]) -> List[Any]:
     return [render.render(t, escpos.paper(printer)) for t in tickets]
 
 
-def deliver(printer: Dict[str, Any], tickets: List[List[Line]], *, sender: Sender = send, who_uses: Optional[Callable[[str], str]] = None,
-            title: str = "XOrdering ticket") -> Dict[str, Any]:
+def deliver(printer: Dict[str, Any], tickets: List[List[Line]], *, data: Optional[bytes] = None, sender: Sender = send,
+            who_uses: Optional[Callable[[str], str]] = None, title: str = "XOrdering ticket") -> Dict[str, Any]:
     """Prints the tickets on the printer; returns what the printer said ({} when nothing), with
-    `method` (tcp | raw | driver). Raises PrinterError (explained) when they didn't get there."""
+    `method` (tcp | raw | driver). Raises PrinterError (explained) when they didn't get there.
+
+    `data`: the bytes pipeline.print_tickets() built and checked; they are sent untouched (only the
+    driver fallback draws the same tickets through the driver instead)."""
+    if data is None:
+        data = escpos.tickets_bytes(tickets, printer)
     if connection(printer) == "windows":
         from . import winprint
 
@@ -87,7 +92,7 @@ def deliver(printer: Dict[str, Any], tickets: List[List[Line]], *, sender: Sende
         if printer.get("windowsMethod") == "driver":
             return winprint.send_picture(name, pictures(tickets, printer), title)
         try:
-            return winprint.send_raw(name, escpos.tickets_bytes(tickets, printer), title)
+            return winprint.send_raw(name, data, title)
         except PrinterError as e:
             if e.code != "driver":
                 raise
@@ -100,7 +105,7 @@ def deliver(printer: Dict[str, Any], tickets: List[List[Line]], *, sender: Sende
         raise PrinterError("没有填 IP 地址 No IP address", "unreachable")
     kind = "star" if escpos.kind(printer) == "star" else "escpos"
     try:
-        st = sender(host, port, escpos.tickets_bytes(tickets, printer), kind=kind) or {}
+        st = sender(host, port, data, kind=kind) or {}
     except PrinterError as e:
         raise explain_tcp_failure(host, e, who_uses) from None
     return dict(st, method="tcp")

@@ -17,9 +17,11 @@ class FakeServer:
         self.statuses = []
         self.previews = []
         self.preview_requested = None
+        self.paused = None  # None: an older server (no pause switch)
+        self.pause_calls = []
 
     def add(self, job_id, printer_id, number, reason="new", **order):
-        o = None if reason == "test" else dict(ORDER, number=number, **order)
+        o = None if reason == "test" else dict(ORDER, number=number, **dict({"id": f"o-{number}"}, **order))
         self.jobs[job_id] = {"id": job_id, "printerId": printer_id, "reason": reason, "status": "pending", "order": o}
 
     def client(self, cfg):
@@ -34,7 +36,18 @@ class FakeServer:
                     raise api.ApiError("device_revoked", 400)
                 return {"restaurant": {"id": "r-1", "name": {"zh": "金莲小馆", "en": "Golden Lotus"}, "currency": "CAD", "taxRateBps": 500, "prepMinutes": 15},
                         "printers": server.printers, "device": {"name": "PC"}, "previewRequestedAt": server.preview_requested,
-                        "jobs": [j for j in server.jobs.values() if j["status"] in ("pending", "failed")]}
+                        "jobs": [j for j in server.jobs.values() if j["status"] in ("pending", "failed")], **({} if server.paused is None else {"paused": server.paused})}
+
+            def set_paused(self, token, paused, skip_waiting=False):
+                if not server.online:
+                    raise api.NetworkError("offline")
+                server.pause_calls.append((paused, skip_waiting))
+                server.paused = paused
+                if skip_waiting:
+                    for j in server.jobs.values():
+                        if j["status"] in ("pending", "failed"):
+                            j["status"] = "skipped"
+                return {"paused": paused}
 
             def status(self, token, st):
                 if not server.online:

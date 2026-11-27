@@ -202,8 +202,29 @@ def run_service(after_update: bool = False) -> int:
     return Service().run(after_update=after_update)
 
 
+def worker_lock() -> Optional[socket.socket]:
+    """The worker's single-instance lock (one print loop per computer, whoever started it): a local
+    port held for its lifetime. None when another worker already holds it."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if IS_WINDOWS:
+        s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", -5), 1)
+    try:
+        s.bind(("127.0.0.1", CONTROL_PORT + 1))
+        s.listen(1)
+        return s
+    except OSError:
+        s.close()
+        return None
+
+
 def run_worker() -> int:
     from .worker import Worker
+
+    lock = worker_lock()
+    if lock is None:
+        get_log().warning("another print loop is already running on this computer: this one stops (no ticket prints twice)")
+        time.sleep(30)  # the service would start us again right away otherwise
+        return 0
 
     update = None
     if FROZEN and IS_WINDOWS:
@@ -212,7 +233,10 @@ def run_worker() -> int:
         def update() -> bool:
             return bool(config.load().get("autoUpdate", True)) and updater.check_and_download()
 
-    return Worker().run_forever(update_check=update)
+    try:
+        return Worker().run_forever(update_check=update)
+    finally:
+        lock.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

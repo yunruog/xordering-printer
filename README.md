@@ -160,16 +160,36 @@ XOrdering (Supabase)  <── HTTPS, every 4 s ──  XOrderingPrinter (shop PC
   a shortcut to the Startup folder (`--service`) and a scheduled task that starts it again every 5
   minutes if it stopped. The service runs the print loop as a separate process and restarts it when
   it exits.
-- **Updates:** once a day the program checks
+- **Updates:** every 3 hours the program checks
   `https://api.github.com/repos/yunruog/xordering-printer/releases/latest`; a newer
   `XOrderingPrinter.exe` is downloaded, checked against `XOrderingPrinter.exe.sha256`, swapped in
   and started; if it doesn't come up, the previous version is put back.
-- **Log:** `%APPDATA%\XOrderingPrinter\logs\printer.log` (rotating, ~5 MB). Tokens and keys are
-  never written to it.
+- **One pipeline, checked:** every ticket (orders, the dashboard's test page, the window's test page
+  and connection test, Reprint last order) goes through `pipeline.print_tickets()`: drawn at the
+  printer's paper width, made black and white, turned into the type's commands, then **checked**
+  before anything is sent: the type's start command (ESC @ / ESC * r R), every picture row exactly
+  the paper's width (576 dots for 80 mm, 384 for 58 mm), at most 3x the rows the content needs, and
+  no Star raster to a printer whose Windows driver is an ESC/POS one (that printed metres of text
+  garbage at Tsunami Sushi on 2026-11-27). A ticket that fails is not sent: the window shows it in
+  red, and the dashboard lists it under Not printed.
+- **Once:** a job id prints once; a second "new" job for an order already printed on that printer is
+  skipped (reported `skipped`); a failure after which part of the ticket may have printed (bytes cut
+  short, connection lost) is tried at most 3 times, 10 s+ apart, then given up (reprint by hand); a
+  printer that is off or busy doesn't use up tries. A Windows job already printing is never taken
+  back. One print loop per computer (a local port lock, 47292).
+- **Pause printing:** the window's switch and the dashboard's are one (`print_device_set_paused` /
+  `set_printing_paused`): tickets wait; resuming prints them or skips them. **Reprint last order**
+  prints the newest order again (REPRINT) on the selected printer, without the server.
+- **Log:** `%APPDATA%\XOrderingPrinter\logs\printer.log` (rotating, ~5 MB) and
+  `print-jobs.jsonl`: one `PRINTJOB` line per attempt with source, order, job, attempt, type, paper,
+  connection, API and datatype (`winspool WritePrinter` / RAW, `GDI StartDoc` / EMF, TCP socket),
+  byte count, first 64 and last 32 bytes in hex, result. **Copy log** in the window copies the
+  printers, the last print jobs and the log's tail. Tokens and keys are never written to it.
 
 | File | |
 | --- | --- |
-| `xordering_printer/worker.py` | poll → print → report loop |
+| `xordering_printer/worker.py` | poll → print → report loop, pause |
+| `xordering_printer/pipeline.py` | the one way tickets print: build, check, send, log; Copy log |
 | `xordering_printer/jobs.py` | local ticket queue (SQLite) |
 | `xordering_printer/ticket.py` | the ticket's lines, the sample order (test page, preview) |
 | `xordering_printer/render.py` | the ticket as a 576-dot picture (bundled font) |
@@ -203,6 +223,6 @@ service's local control port (default 47291).
 **Release:** bump `VERSION` in `xordering_printer/__init__.py`, commit, tag `vX.Y.Z` and push the
 tag. GitHub Actions (`.github/workflows/release.yml`) tests, builds the exe on Windows with
 PyInstaller, smoke-tests it and publishes it with its SHA-256 to Releases. Installed copies pick it
-up within a day.
+up within 3 hours (0.3.0 and older: within a day).
 
 MIT License.

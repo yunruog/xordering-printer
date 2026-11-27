@@ -32,6 +32,7 @@ PRINTER_ATTRIBUTE_WORK_OFFLINE = 0x400
 J_PAUSED, J_ERROR, J_DELETING, J_SPOOLING, J_PRINTING, J_OFFLINE, J_PAPEROUT = 0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40
 J_PRINTED, J_DELETED, J_BLOCKED, J_USER_INTERVENTION, J_COMPLETE = 0x80, 0x100, 0x200, 0x400, 0x1000
 JOB_CONTROL_DELETE = 5
+PRINTING_TIMEOUT = 180.0  # a job already printing is waited for this long, then left to finish
 
 STATUS_TEXT = [
     (P_PAUSED, "paused 已暂停"), (P_ERROR, "error 错误"), (P_PAPER_JAM, "paper jam 卡纸"), (P_PAPER_OUT, "out of paper 缺纸"),
@@ -164,6 +165,26 @@ def _list_powershell() -> List[Dict[str, Any]]:
     return out
 
 
+def driver_name(name: str) -> str:
+    """The Windows driver of a printer ('' when unknown): pipeline.py checks the printer type against it."""
+    if not name:
+        return ""
+    try:
+        import win32print
+    except ImportError:
+        return ""
+    try:
+        handle = win32print.OpenPrinter(name)
+    except Exception:
+        return ""
+    try:
+        return str(win32print.GetPrinter(handle, 2).get("pDriverName") or "")
+    except Exception:
+        return ""
+    finally:
+        win32print.ClosePrinter(handle)
+
+
 def default_printer() -> str:
     try:
         import win32print
@@ -216,11 +237,13 @@ def _job_reason(job_status: int, printer_status: int, text: str) -> str:
     return ", ".join(bits) or "没有送到打印机 didn't reach the printer"
 
 
-def wait_for_job(win32print: Any, handle: Any, name: str, job_id: int, timeout: float = 30.0, poll: float = 0.3) -> None:
+def wait_for_job(win32print: Any, handle: Any, name: str, job_id: int, timeout: float = 30.0, poll: float = 0.3) -> Dict[str, Any]:
     """Until the job has gone to the printer; a stuck job is deleted and PrinterError raised.
 
     Done: the job left the queue, or says printed / complete (a queue that keeps printed jobs).
-    Stuck: still there after `timeout`, or in error / offline / paper out for a few seconds.
+    Stuck: still there after `timeout`, or in error / offline / paper out for a few seconds, without
+    having started printing. A job that is printing is never taken back ({"slow": True} after
+    PRINTING_TIMEOUT).
     """
     started = time.time()
     bad_since: Optional[float] = None
@@ -229,10 +252,20 @@ def wait_for_job(win32print: Any, handle: Any, name: str, job_id: int, timeout: 
         try:
             job = win32print.GetJob(handle, job_id, 1)
         except Exception:
-            return  # no longer in the queue: sent
+            return {}  # no longer in the queue: sent
         st = int(job.get("Status") or 0)
         if st & (J_PRINTED | J_COMPLETE | J_DELETED):
-            return
+            return {}
+        # Bytes are already going to the printer: taking the job back now would cut a picture off in
+        # the middle of a command, and the printer would print the rest (and the next ticket) as
+        # text garbage. Let it finish; past the long wait it stays in the Windows queue and is
+        # counted as sent (never sent a second time).
+        flowing = bool(st & J_PRINTING) or int(job.get("PagesPrinted") or 0) > 0
+        if flowing and time.time() - started > timeout:
+            if time.time() - started > PRINTING_TIMEOUT:
+                return {"slow": True}
+            time.sleep(poll)
+            continue
         try:
             pst = int(win32print.GetPrinter(handle, 2).get("Status") or 0)
         except Exception:
@@ -244,7 +277,7 @@ def wait_for_job(win32print: Any, handle: Any, name: str, job_id: int, timeout: 
         else:
             bad_since = None
         now = time.time()
-        if (bad_since and now - bad_since > 5) or now - started > timeout:
+        if not flowing and ((bad_since and now - bad_since > 5) or now - started > timeout):
             try:
                 win32print.SetJob(handle, job_id, 0, None, JOB_CONTROL_DELETE)
             except Exception:
@@ -284,9 +317,10 @@ def send_raw(name: str, data: bytes, title: str = "XOrdering ticket", timeout: f
             raise _explain(e, name) from None
         win32print.EndDocPrinter(handle)
         if written is not None and int(written) < len(data):
-            raise PrinterError(f"“{name}”: only {written} of {len(data)} bytes accepted", "driver")
-        wait_for_job(win32print, handle, name, job_id, timeout)
-        return {"job": job_id, "method": "raw"}
+            # Part of the ticket may print: never fall back to the driver (a second copy) for this.
+            raise PrinterError(f"“{name}”: Windows 只接受了 {written}/{len(data)} 字节 only {written} of {len(data)} bytes accepted", "partial")
+        done = wait_for_job(win32print, handle, name, job_id, timeout) or {}
+        return dict(done, job=job_id, method="raw")
     finally:
         win32print.ClosePrinter(handle)
 
@@ -330,9 +364,10 @@ def send_picture(name: str, images: List[Any], title: str = "XOrdering ticket", 
                 dc.DeleteDC()
             except Exception:
                 pass
+        done: Dict[str, Any] = {}
         if isinstance(job_id, int) and job_id > 0:
-            wait_for_job(win32print, handle, name, job_id, timeout)
-        return {"job": job_id, "method": "driver"}
+            done = wait_for_job(win32print, handle, name, job_id, timeout) or {}
+        return dict(done, job=job_id, method="driver")
     finally:
         win32print.ClosePrinter(handle)
 

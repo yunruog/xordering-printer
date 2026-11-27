@@ -2,7 +2,8 @@
 
 Every call after setup uses only the device token: print_device_poll (the restaurant, its printers
 and the tickets to print), print_device_report (printed / failed), print_device_save_printer,
-print_device_status (printer states) and print_device_preview (the sample tickets as PNG).
+print_device_status (printer states), print_device_preview (the sample tickets as PNG) and
+print_device_set_paused (the "Pause printing" switch, shared with the dashboard).
 Setup uses either a device key (print_device_pair, recommended) or the owner's email sign-in (the
 same 6-digit email code as the dashboard: the ordering-auth function), which is used once to register
 this computer and then signed out. No SMS.
@@ -127,6 +128,10 @@ class Client:
 
     def report(self, token: str, job_id: str, status: str, error: Optional[str] = None) -> Dict[str, Any]:
         return self.rpc("print_device_report", {"p_token": token, "p_job_id": job_id, "p_status": status, "p_error": error})
+
+    def set_paused(self, token: str, paused: bool, skip_waiting: bool = False) -> Dict[str, Any]:
+        """Pauses or resumes printing for the restaurant (the dashboard shows the same switch)."""
+        return self.rpc("print_device_set_paused", {"p_token": token, "p_paused": paused, "p_skip_waiting": skip_waiting})
 
     def save_printer(self, token: str, printer: Dict[str, Any]) -> Dict[str, Any]:
         return self.rpc("print_device_save_printer", {"p_token": token, "p_printer": printer})
