@@ -332,6 +332,7 @@ def load_seen() -> Dict[str, Any]:
 
 def who_uses(host: str, within: float = 180, ports: Iterable[int] = PRINT_PORTS, include_loopback: bool = False) -> str:
     """The program connected to this printer now (or within `within` seconds), '' when none."""
+    ports = list(ports)
     try:
         now = [c for c in printer_connections(ports, include_loopback=include_loopback) if c["ip"] == host]
     except Exception:
@@ -340,8 +341,9 @@ def who_uses(host: str, within: float = 180, ports: Iterable[int] = PRINT_PORTS,
     if named:
         return named[0]
     cutoff = time.time() - within
+    wanted = set(ports)
     for v in load_seen().values():
-        if v.get("ip") == host and float(v.get("last") or 0) >= cutoff:
+        if v.get("ip") == host and v.get("port") in wanted and float(v.get("last") or 0) >= cutoff:
             return v.get("process") or "另一个程序 another program"
     if now:
         return "另一个程序 another program"
