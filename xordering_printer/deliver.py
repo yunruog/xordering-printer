@@ -19,7 +19,7 @@ from .printer import PrinterError, send
 from .ticket import Line
 
 Sender = Callable[..., Dict[str, Any]]
-CONNECT_CODES = ("refused", "timeout", "busy", "lost", "unreachable")
+CONNECT_CODES = ("refused", "timeout", "busy", "lost", "reset", "unreachable")
 
 
 def connection(printer: Dict[str, Any]) -> str:

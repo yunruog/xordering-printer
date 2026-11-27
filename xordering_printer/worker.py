@@ -41,7 +41,7 @@ STUCK_ATTEMPTS = 3
 REDISCOVER_EVERY = 1800.0
 CONNECTION_SAMPLE = 15.0
 # Failures after which part of the ticket may have printed: these use up one of the job's MAX_TRIES.
-# The others (printer off, busy, in use by the POS, out of paper before it started) only wait.
+# The others (printer off, busy, in use by the POS, out of paper, reset before reading) only wait.
 MAYBE_PRINTED = ("partial", "lost", "driver")
 
 

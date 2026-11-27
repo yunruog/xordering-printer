@@ -175,8 +175,9 @@ XOrdering (Supabase)  <── HTTPS, every 4 s ──  XOrderingPrinter (shop PC
 - **Once:** a job id prints once; a second "new" job for an order already printed on that printer is
   skipped (reported `skipped`); a failure after which part of the ticket may have printed (bytes cut
   short, connection lost) is tried at most 3 times, 10 s+ apart, then given up (reprint by hand); a
-  printer that is off or busy doesn't use up tries. A Windows job already printing is never taken
-  back. One print loop per computer (a local port lock, 47292).
+  printer that is off or busy doesn't use up tries. A Windows job taken back after it started
+  printing counts as a try too. One print loop per computer (a local port
+  lock, 47292).
 - **Pause printing:** the window's switch and the dashboard's are one (`print_device_set_paused` /
   `set_printing_paused`): tickets wait; resuming prints them or skips them. **Reprint last order**
   prints the newest order again (REPRINT) on the selected printer, without the server.

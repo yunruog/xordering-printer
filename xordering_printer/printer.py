@@ -62,7 +62,8 @@ def _status(sock: socket.socket, n: int) -> Optional[int]:
     except socket.timeout:
         return None
     except OSError as e:
-        raise PrinterError(f"connection lost: {e}", "lost") from None
+        # Asking for the status, before the ticket: nothing printed (a busy printer drops us).
+        raise PrinterError(f"connection lost: {e}", "busy") from None
     finally:
         sock.settimeout(CONNECT_TIMEOUT)
     if not data:
@@ -105,7 +106,8 @@ def _star_status(sock: socket.socket, timeout: float = STATUS_TIMEOUT) -> Option
     except socket.timeout:
         return None
     except OSError as e:
-        raise PrinterError(f"connection lost: {e}", "lost") from None
+        # Asking for the status, before the ticket: nothing printed (a busy printer drops us).
+        raise PrinterError(f"connection lost: {e}", "busy") from None
     finally:
         sock.settimeout(CONNECT_TIMEOUT)
     if not data:
@@ -157,7 +159,7 @@ def send(host: str, port: int, payload: bytes, *, check_status: bool = True, kin
             while time.time() < deadline and sock.recv(256):
                 pass
         except ConnectionResetError:
-            raise PrinterError(f"{host}:{port} reset the connection before reading the ticket", "lost") from None
+            raise PrinterError(f"{host}:{port} reset the connection before reading the ticket", "reset") from None
         except (OSError, PrinterError):
             pass
     finally:

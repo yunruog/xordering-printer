@@ -32,7 +32,6 @@ PRINTER_ATTRIBUTE_WORK_OFFLINE = 0x400
 J_PAUSED, J_ERROR, J_DELETING, J_SPOOLING, J_PRINTING, J_OFFLINE, J_PAPEROUT = 0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40
 J_PRINTED, J_DELETED, J_BLOCKED, J_USER_INTERVENTION, J_COMPLETE = 0x80, 0x100, 0x200, 0x400, 0x1000
 JOB_CONTROL_DELETE = 5
-PRINTING_TIMEOUT = 180.0  # a job already printing is waited for this long, then left to finish
 
 STATUS_TEXT = [
     (P_PAUSED, "paused 已暂停"), (P_ERROR, "error 错误"), (P_PAPER_JAM, "paper jam 卡纸"), (P_PAPER_OUT, "out of paper 缺纸"),
@@ -241,13 +240,14 @@ def wait_for_job(win32print: Any, handle: Any, name: str, job_id: int, timeout: 
     """Until the job has gone to the printer; a stuck job is deleted and PrinterError raised.
 
     Done: the job left the queue, or says printed / complete (a queue that keeps printed jobs).
-    Stuck: still there after `timeout`, or in error / offline / paper out for a few seconds, without
-    having started printing. A job that is printing is never taken back ({"slow": True} after
-    PRINTING_TIMEOUT).
+    Stuck: still there after `timeout`, or in error / offline / paper out for a few seconds. A job
+    taken back after it had started printing with nothing wrong raises code "partial": the worker
+    counts it as one of the ticket's 3 tries, so a cut-off ticket isn't printed again and again.
     """
     started = time.time()
     bad_since: Optional[float] = None
     last: Dict[str, Any] = {}
+    was_printing = False
     while True:
         try:
             job = win32print.GetJob(handle, job_id, 1)
@@ -256,16 +256,7 @@ def wait_for_job(win32print: Any, handle: Any, name: str, job_id: int, timeout: 
         st = int(job.get("Status") or 0)
         if st & (J_PRINTED | J_COMPLETE | J_DELETED):
             return {}
-        # Bytes are already going to the printer: taking the job back now would cut a picture off in
-        # the middle of a command, and the printer would print the rest (and the next ticket) as
-        # text garbage. Let it finish; past the long wait it stays in the Windows queue and is
-        # counted as sent (never sent a second time).
-        flowing = bool(st & J_PRINTING) or int(job.get("PagesPrinted") or 0) > 0
-        if flowing and time.time() - started > timeout:
-            if time.time() - started > PRINTING_TIMEOUT:
-                return {"slow": True}
-            time.sleep(poll)
-            continue
+        was_printing = was_printing or bool(st & J_PRINTING)
         try:
             pst = int(win32print.GetPrinter(handle, 2).get("Status") or 0)
         except Exception:
@@ -277,18 +268,23 @@ def wait_for_job(win32print: Any, handle: Any, name: str, job_id: int, timeout: 
         else:
             bad_since = None
         now = time.time()
-        if not flowing and ((bad_since and now - bad_since > 5) or now - started > timeout):
+        if (bad_since and now - bad_since > 5) or now - started > timeout:
             try:
                 win32print.SetJob(handle, job_id, 0, None, JOB_CONTROL_DELETE)
             except Exception:
                 pass
             reason = _job_reason(last.get("job", 0), last.get("printer", 0), last.get("text", ""))
             code = "paper_out" if "paper" in reason else "cover_open" if "cover" in reason else "offline"
+            if was_printing and not bad:
+                # It had started printing with nothing wrong: part of the ticket may be out (and the
+                # printer left mid-picture). Counted as a try (at most 3), not retried forever.
+                code = "partial"
+                reason = "已开始打印但没有完成 started printing but didn't finish"
             raise PrinterError(f"“{name}”: {reason}（已从 Windows 队列撤回，稍后重试 taken back from the Windows queue, will retry）", code)
         time.sleep(poll)
 
 
-def send_raw(name: str, data: bytes, title: str = "XOrdering ticket", timeout: float = 30.0) -> Dict[str, Any]:
+def send_raw(name: str, data: bytes, title: str = "XOrdering ticket", timeout: float = 60.0) -> Dict[str, Any]:
     """The printer bytes as one RAW job; returns {job, method: raw} once it reached the printer."""
     try:
         import win32print

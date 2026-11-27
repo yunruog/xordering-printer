@@ -954,6 +954,9 @@ PROBE_ERRORS = {
     "unreachable": "网段不对：这台电脑和打印机不在同一网络。\nWrong network: this computer can't reach the printer.",
     "busy": "打印机断开了连接（可能正忙于其他程序）。\nThe printer dropped the connection (busy with another program?).",
     "lost": "连接中断，小票没有送完。\nThe connection dropped before the ticket was sent.",
+    "reset": "打印机没有读取小票就断开了（忙？），会自动重试。\nThe printer dropped the connection before reading the ticket (busy?): it is retried.",
+    "partial": "小票只送出了一部分，最多重试 3 次。\nOnly part of the ticket got out: tried at most 3 times.",
+    "bad_ticket": "小票数据没通过检查，没有发送。\nThe ticket failed its check and was not sent.",
     "cover_open": "打印机盖子开着。\nThe printer's cover is open.",
     "paper_out": "打印机没纸了。\nThe printer is out of paper.",
 }

@@ -282,48 +282,43 @@ class PipelineTest(unittest.TestCase):
 
 
 class WindowsJobWaitTest(unittest.TestCase):
-    """A RAW job already printing is never taken back (that cut pictures in half: garbage + reprints)."""
+    """A Windows job taken back after it started printing counts as a try (not retried forever)."""
 
-    def test_printing_job_is_not_deleted(self):
-        from unittest import mock
-
+    def wait(self, job_status, printer_status=0):
         from xordering_printer import winprint
 
         calls = {"deleted": 0}
 
         class W:
             def GetJob(self, h, j, level):
-                return {"Status": winprint.J_PRINTING, "PagesPrinted": 0, "pStatus": ""}
+                return {"Status": job_status, "pStatus": ""}
 
             def GetPrinter(self, h, level):
-                return {"Status": 0}
+                return {"Status": printer_status}
 
             def SetJob(self, *a):
                 calls["deleted"] += 1
 
-        with mock.patch.object(winprint, "PRINTING_TIMEOUT", 0.3):
-            st = winprint.wait_for_job(W(), None, "Kitchen", 7, timeout=0.1, poll=0.02)
-        self.assertEqual(st, {"slow": True})
-        self.assertEqual(calls["deleted"], 0)
-
-    def test_job_that_never_started_is_taken_back(self):
-        from xordering_printer import winprint
-
-        calls = {"deleted": 0}
-
-        class W:
-            def GetJob(self, h, j, level):
-                return {"Status": winprint.J_OFFLINE, "pStatus": ""}
-
-            def GetPrinter(self, h, level):
-                return {"Status": winprint.P_OFFLINE}
-
-            def SetJob(self, *a):
-                calls["deleted"] += 1
-
-        with self.assertRaises(PrinterError):
+        with self.assertRaises(PrinterError) as e:
             winprint.wait_for_job(W(), None, "Kitchen", 7, timeout=0.2, poll=0.02)
         self.assertEqual(calls["deleted"], 1)
+        return e.exception.code
+
+    def test_printing_job_taken_back_counts_as_a_try(self):
+        from xordering_printer import winprint
+        from xordering_printer.worker import MAYBE_PRINTED
+
+        code = self.wait(winprint.J_PRINTING)
+        self.assertEqual(code, "partial")
+        self.assertIn(code, MAYBE_PRINTED)
+
+    def test_offline_job_only_waits(self):
+        from xordering_printer import winprint
+        from xordering_printer.worker import MAYBE_PRINTED
+
+        code = self.wait(winprint.J_OFFLINE, winprint.P_OFFLINE)
+        self.assertEqual(code, "offline")
+        self.assertNotIn(code, MAYBE_PRINTED)
 
 
 if __name__ == "__main__":

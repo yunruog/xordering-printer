@@ -16,9 +16,9 @@ Download `XOrderingPrinter.exe` and double-click it; nothing else to install. Se
 - 诊断日志：每张小票记录来源、订单号、第几次尝试、类型、纸宽、连接方式、Windows API 和数据类型、字节数、
   前 64 / 后 32 字节（十六进制）。“复制日志”一键复制。A log line per ticket (bytes in hex …); "Copy log" copies it.
 - 防重复、防浪费：同一订单只打一次（除非重打）；可能已经打出一部分的失败最多重试 3 次，每次间隔 10 秒以上；
-  打印中的 Windows 任务不再被撤回（以前撤回会把图片截断成乱码再重打）；一台电脑只运行一个打印进程；
-  小票底部不再留空白。Each order prints once; at most 3 tries when part of it may have printed; a Windows job that
-  is printing is never taken back; one print loop per computer; no blank paper under the ticket.
+  打印到一半被撤回的 Windows 任务也算一次重试（不会反复重打）；一台电脑只运行一个打印进程；
+  小票底部不再留空白。Each order prints once; at most 3 tries when part of it may have printed; a Windows job taken
+  back mid-print counts as a try; one print loop per computer; no blank paper under the ticket.
 - “暂停打印”开关（窗口和后台都有）：暂停期间订单排队不打印，恢复时可选择补打或跳过。
   Pause printing (here and on the dashboard): tickets wait; on resume, print them or skip them.
 - “重打最近一单”按钮：不用下单就能验证。Reprint last order, to check a printer without placing an order.

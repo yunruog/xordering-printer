@@ -269,8 +269,6 @@ def print_tickets(printer: Dict[str, Any], tickets: List[List[Line]], *, source:
     entry.update(result="sent", api=api, datatype=datatype, method=method)
     if st.get("fallback"):
         entry["fallback"] = st["fallback"]
-    if st.get("slow"):
-        entry["note"] = "still printing after the wait: left in the Windows queue (not sent again)"
     record(entry)
     return st
 
