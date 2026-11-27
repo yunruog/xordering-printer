@@ -20,6 +20,7 @@ Also importable: MockPrinter(port, out).start() / .stop() (tests run several at 
 import argparse
 import json
 import socket
+import struct
 import threading
 import time
 from pathlib import Path
@@ -252,7 +253,8 @@ def raster_png(rasters, path: Path) -> bool:
 
 
 class MockPrinter:
-    def __init__(self, port: int = 9100, out: str = "mock-prints", host: str = "127.0.0.1", paper_out: bool = False, quiet: bool = False, star: bool = False):
+    def __init__(self, port: int = 9100, out: str = "mock-prints", host: str = "127.0.0.1", paper_out: bool = False, quiet: bool = False, star: bool = False,
+                 exclusive: bool = False):
         self.port, self.host = port, host
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
@@ -264,6 +266,10 @@ class MockPrinter:
         # Busy with another device (the POS): until then, connections are accepted and dropped unread.
         self.busy_until = 0.0
         self.busy_hits = 0
+        # Like a Star LAN printer: one connection at a time. While one is open (the POS holding the
+        # printer), others are reset at once.
+        self.exclusive = exclusive
+        self.active = 0
         self.format_errors: List[str] = []
         self.status_requests = 0
         self.tickets: List[dict] = []
@@ -319,8 +325,28 @@ class MockPrinter:
         return bytes([0x23, 0x86, ps1, 0x00, 0x00, ps4, 0x00, 0x00, 0x00])
 
     def _handle(self, conn: socket.socket) -> None:
+        with self._lock:
+            taken = self.exclusive and self.active > 0
+            if not taken:
+                self.active += 1
+        if taken:
+            with self._lock:
+                self.busy_hits += 1
+            try:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            except OSError:
+                pass
+            conn.close()  # reset: the printer is taken
+            return
+        try:
+            self._serve(conn)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+    def _serve(self, conn: socket.socket) -> None:
         data = bytearray()
-        conn.settimeout(3)
+        conn.settimeout(30 if self.exclusive else 3)
         if time.time() < self.busy_until:
             with self._lock:
                 self.busy_hits += 1
@@ -422,8 +448,9 @@ def main() -> None:
     p.add_argument("--out", default="mock-prints")
     p.add_argument("--paper-out", action="store_true")
     p.add_argument("--star", action="store_true", help="a Star TSP100 (Star Graphic Mode raster only)")
+    p.add_argument("--exclusive", action="store_true", help="one connection at a time, like a Star LAN printer")
     a = p.parse_args()
-    MockPrinter(a.port, a.out, a.host, a.paper_out, star=a.star).start()
+    MockPrinter(a.port, a.out, a.host, a.paper_out, star=a.star, exclusive=a.exclusive).start()
     print(f"Mock printer listening on {a.host}:{a.port}, saving tickets to {a.out}/ (Ctrl+C to stop)")
     try:
         while True:

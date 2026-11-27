@@ -3,9 +3,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -15,4 +17,27 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
+      # A printer installed in Windows for the Windows printer tests (tests/test_winprint.py): the Generic /
+      # Text Only driver on a Standard TCP/IP port to 127.0.0.1:9187, where the tests run a pretend Star printer.
+      - name: Install a test printer in Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Service Spooler -StartupType Automatic
+          Start-Service Spooler
+          Add-PrinterDriver -Name "Generic / Text Only"
+          Add-PrinterPort -Name "XOP_TEST_PORT" -PrinterHostAddress "127.0.0.1" -PortNumber 9187
+          Add-Printer -Name "Star TSP143 (XOP test)" -DriverName "Generic / Text Only" -PortName "XOP_TEST_PORT"
+          Get-Printer | Format-Table Name, DriverName, PortName -AutoSize
+          "XOP_TEST_PRINTER=Star TSP143 (XOP test)" >> $env:GITHUB_ENV
+          "XOP_TEST_PRINTER_PORT=9187" >> $env:GITHUB_ENV
       - run: python -m unittest discover -s tests -t . -v
+      - name: Screenshots of the printer windows
+        if: runner.os == 'Windows'
+        run: python e2e/gui_screens.py
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows' && always()
+        with:
+          name: screens
+          path: e2e-output/screens
+          if-no-files-found: ignore

@@ -10,9 +10,11 @@ import re
 import socket
 from typing import Any, Dict, List, Optional
 
-from . import api, config, escpos, render, ticket
+import time
+
+from . import api, config, deliver, discover, escpos, render, ticket
 from .logs import get as get_log
-from .printer import probe, scan, send
+from .printer import PrinterError, probe
 
 
 def computer_name() -> str:
@@ -95,37 +97,123 @@ def refresh() -> Dict[str, Any]:
     return config.update(restaurant=res.get("restaurant"), printers=res.get("printers") or [])
 
 
+SERVER_KEYS = ("id", "name", "host", "port", "paperWidth", "render", "enabled", "assignment")
+
+
+def host_label() -> str:
+    """What the dashboard shows as the address of a printer reached through this computer's Windows
+    printer (USB, Bluetooth): the computer's name, as a valid host name."""
+    name = re.sub(r"[^A-Za-z0-9-]+", "-", computer_name()).strip("-")[:60]
+    return name if name and name[0].isalnum() else "windows-printer"
+
+
 def save_printer(printer: Dict[str, Any]) -> Dict[str, Any]:
+    """Saves a printer: name, address, type and paper on the server (the dashboard shows them), and
+    how this computer reaches it (IP or Windows printer) here, in config.json's printerLocal."""
     cfg = config.load()
-    saved = api.client_for(cfg).save_printer(cfg["deviceToken"], printer)
+    windows = printer.get("connection") == "windows"
+    server = {k: v for k, v in printer.items() if k in SERVER_KEYS}
+    server.setdefault("assignment", "full")
+    if windows and not (server.get("host") or "").strip():
+        server["host"] = host_label()
+    saved = api.client_for(cfg).save_printer(cfg["deviceToken"], server)
+    cfg = config.load()
     printers = [p for p in cfg.get("printers") or [] if p.get("id") != saved["id"]] + [saved]
     printers.sort(key=lambda p: (p.get("position", 0), p.get("name", "")))
     config.update(printers=printers)
-    return saved
+    if windows:
+        old = (cfg.get("printerLocal") or {}).get(saved["id"]) or {}
+        same = old.get("windowsPrinter") == printer.get("windowsPrinter")
+        config.set_local(saved["id"], connection="windows", windowsPrinter=printer.get("windowsPrinter") or "",
+                         windowsMethod=(printer.get("windowsMethod") or (old.get("windowsMethod") if same else None)))
+    else:
+        config.set_local(saved["id"], connection="tcp", windowsPrinter=None, windowsMethod=None)
+    get_log().info("printer saved: %s via %s", saved.get("name"), deliver.describe(dict(saved, **{k: printer.get(k) for k in ("connection", "windowsPrinter")})))
+    return next((p for p in config.effective_printers(config.load()) if p["id"] == saved["id"]), saved)
 
 
 def _kind(printer: Dict[str, Any]) -> str:
     return "star" if escpos.kind(printer) == "star" else "escpos"
 
 
-def test_print(printer: Dict[str, Any]) -> None:
-    """Prints the test page (the sample order, ASAP and scheduled) straight to the printer."""
+def test_print(printer: Dict[str, Any]) -> Dict[str, Any]:
+    """Prints the test page (the sample order, ASAP and scheduled) the way this computer reaches the printer."""
     cfg = config.load()
-    payload = escpos.tickets_bytes(ticket.test_tickets(cfg.get("restaurant")), printer)
-    send(printer["host"], int(printer.get("port") or 9100), payload, kind=_kind(printer))
-    get_log().info("test page sent to %s (%s)", printer.get("name"), printer.get("host"))
+    st = deliver.deliver(printer, ticket.test_tickets(cfg.get("restaurant")), title="XOrdering test page")
+    _remember_fallback(printer, st)
+    get_log().info("test page sent to %s (%s)", printer.get("name"), deliver.describe(printer))
+    return st
 
 
-def test_connection(host: str, port: int = 9100, render_kind: str = "text") -> Dict[str, Any]:
-    """Connects to the printer without printing: {ok, ms, status} or raises PrinterError (timeout, refused, …)."""
-    return probe(host.strip(), int(port or 9100), kind="star" if render_kind == "star" else "escpos")
+def _remember_fallback(printer: Dict[str, Any], st: Dict[str, Any]) -> None:
+    if st.get("fallback") and printer.get("id"):
+        config.set_local(printer["id"], windowsMethod="driver")
 
 
-def find_printers(port: int = 9100) -> List[str]:
-    """Devices on this computer's network(s) with the printer port open."""
-    found = scan(port)
-    get_log().info("printer scan found %s", ", ".join(found) or "nothing")
-    return found
+def test_connection(printer: Dict[str, Any]) -> Dict[str, Any]:
+    """The connection test: really prints one short ticket (store, time, connection, printer).
+
+    {ok, ms, method, status} or raises PrinterError explaining why (wrong network, in use by
+    another program, offline, driver error …).
+    """
+    cfg = config.load()
+    started = time.time()
+    st = deliver.deliver(printer, [ticket.test_lines(printer, cfg.get("restaurant"))], title="XOrdering connection test")
+    _remember_fallback(printer, st)
+    get_log().info("connection test printed on %s (%s, %s)", printer.get("name"), deliver.describe(printer), st.get("method"))
+    return {"ok": True, "ms": int((time.time() - started) * 1000), "method": st.get("method"), "status": st, "fallback": st.get("fallback")}
+
+
+def check_connection(host: str, port: int = 9100, render_kind: str = "text") -> Dict[str, Any]:
+    """Connects to a network printer without printing: {ok, ms, status} or raises PrinterError."""
+    try:
+        return probe(host.strip(), int(port or 9100), kind="star" if render_kind == "star" else "escpos")
+    except PrinterError as e:
+        raise deliver.explain_tcp_failure(host.strip(), e) from None
+
+
+def find_printers(progress: Optional[discover.Progress] = None) -> Dict[str, Any]:
+    """Looks for printers every way there is (discover.run); the result is kept in discovery.json."""
+    res = discover.run(progress)
+    try:
+        from .worker import discovery_path
+        import json as _json
+
+        discovery_path().write_text(_json.dumps(res, ensure_ascii=False), "utf-8")
+    except Exception:
+        pass
+    top = discover.receipt_printers(res["candidates"])
+    get_log().info("printer search (%.1f s): %s", res.get("seconds", 0), "; ".join(f"{c['name']} {discover.address_text(c)} [{discover.source_text(c)}]" for c in top) or "no receipt printer")
+    return res
+
+
+def last_discovery() -> Optional[Dict[str, Any]]:
+    try:
+        import json as _json
+        from .worker import discovery_path
+
+        return _json.loads(discovery_path().read_text("utf-8"))
+    except Exception:
+        return None
+
+
+def diagnostics(res: Dict[str, Any]) -> str:
+    """The diagnostics report (no tokens or keys), also saved next to the logs."""
+    import json as _json
+
+    from .paths import log_dir, status_path
+
+    try:
+        status = _json.loads(status_path().read_text("utf-8"))
+    except (OSError, ValueError):
+        status = None
+    cfg = config.load()
+    text = discover.report(res, dict(cfg, printers=config.effective_printers(cfg)), status)
+    try:
+        (log_dir() / "diagnostics.txt").write_text(text, "utf-8")
+    except OSError:
+        pass
+    return text
 
 
 def preview_file() -> str:

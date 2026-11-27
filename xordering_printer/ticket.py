@@ -287,16 +287,27 @@ def test_tickets(restaurant: Optional[Dict[str, Any]] = None) -> List[List[Line]
     return [build(o, restaurant or {}, reason="test") for o in sample_orders(restaurant)]
 
 
-def test_lines(printer: Dict[str, Any], restaurant: Optional[Dict[str, Any]] = None) -> List[Line]:
-    """The setup's connection test: one short ticket naming the printer (and Chinese, to check GBK)."""
+def test_lines(printer: Dict[str, Any], restaurant: Optional[Dict[str, Any]] = None, when: Optional[str] = None) -> List[Line]:
+    """The connection test: one short ticket with the store, the time, how this computer reaches the
+    printer (IP or Windows printer) and its type, and some Chinese (to check GBK text mode)."""
+    import time as _time
+
     mode = {"star": "Star raster (TSP100)", "image": "ESC/POS picture", "text": "ESC/POS text (GBK)"}.get(printer.get("render") or "text", "")
+    if printer.get("connection") == "windows":
+        how = ["Connection: Windows printer", f"  {printer.get('windowsPrinter', '')}"]
+        if printer.get("windowsMethod") == "driver":
+            how.append("  (picture through the driver)")
+    else:
+        how = ["Connection: network IP (direct)", f"  {printer.get('host', '')}:{printer.get('port') or 9100}"]
+    paper_w = 80 if printer.get("render") == "star" else printer.get("paperWidth", 80)
     return [
         Line("TEST PRINT · 测试打印", size=2, align="center", bold=True, invert=True),
         Line(restaurant_name(restaurant or {}) or "XOrdering", align="center", bold=True),
+        Line(when or _time.strftime("%Y-%m-%d %H:%M:%S"), align="center"),
         Line(kind="rule"),
         Line(f"Printer: {printer.get('name', '')}"),
-        Line(f"Address: {printer.get('host', '')}:{printer.get('port', 9100)}"),
-        Line(f"Paper: {printer.get('paperWidth', 80)} mm · {mode}"),
+        *[Line(h) for h in how],
+        Line(f"Paper: {paper_w} mm · {mode}"),
         Line(kind="rule"),
         Line("中文测试：麻婆豆腐 干炒牛河 小笼包", bold=True),
         Line(kind="rule"),

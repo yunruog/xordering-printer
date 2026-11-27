@@ -1,2 +1,5 @@
-# Runtime: Python 3.9+ standard library (tkinter, sqlite3, urllib) plus Pillow for image mode.
+# Runtime: Python 3.9+ standard library (tkinter, sqlite3, urllib) plus Pillow for image mode,
+# psutil for finding which program holds a printer connection, pywin32 for Windows printers.
 Pillow>=10
+psutil>=5.9
+pywin32>=306; sys_platform == "win32"

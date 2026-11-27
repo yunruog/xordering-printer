@@ -8,25 +8,57 @@
 
 No internet: tickets already received still print, reports wait, and orders placed meanwhile come
 in with the next successful poll. Printer offline: tickets wait in jobs.db. Neither loses a ticket.
+
+Each printer is reached the way this computer was set up for it (deliver.py: straight to IP:9100,
+or through a Windows printer). A printer shared with the POS (qMenu …) refuses us while the POS
+holds it: the error names that program, the ticket waits and is retried (2 s, 5 s, 10 s … 30 s).
+A printer that keeps failing for STUCK_AFTER seconds is flagged `stuck` (the window shows a red
+warning and suggests Windows printer mode) and the printers are looked for again in the background
+(discovery.json), once per REDISCOVER_EVERY. Every CONNECTION_SAMPLE seconds the worker notes which
+programs are connected to printer ports (seen-connections.json): a POS connects only while it prints.
 """
 import json
 import os
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from . import VERSION, api, config, escpos, render, ticket
+import threading
+
+from . import VERSION, api, config, discover, escpos, render, ticket
+from .deliver import deliver
 from .jobs import JobStore
 from .logs import get as get_log
-from .paths import jobs_db_path, status_path
+from .paths import data_dir, jobs_db_path, status_path
 from .printer import PrinterError, send
 
 UPDATE_EXIT_CODE = 42
+STUCK_AFTER = 180.0
+STUCK_ATTEMPTS = 3
+REDISCOVER_EVERY = 1800.0
+CONNECTION_SAMPLE = 15.0
+
+
+def describe_printer(printer: Dict[str, Any]) -> str:
+    from .deliver import describe
+
+    return describe(printer)
+
+
+def discovery_path():
+    return data_dir() / "discovery.json"
 
 
 class Worker:
-    def __init__(self, store: Optional[JobStore] = None, sender: Callable[[str, int, bytes], None] = send, client_factory: Callable[[Dict[str, Any]], api.Client] = api.client_for):
+    def __init__(self, store: Optional[JobStore] = None, sender: Callable[..., Dict[str, Any]] = send, client_factory: Callable[[Dict[str, Any]], api.Client] = api.client_for,
+                 who_uses: Optional[Callable[[str], str]] = None, rediscover: Optional[Callable[[], Dict[str, Any]]] = None):
         self.store = store or JobStore(str(jobs_db_path()))
         self.send = sender
+        self.who_uses = who_uses
+        self.rediscover_fn = rediscover or (lambda: discover.run())
+        self.failing: Dict[str, Dict[str, float]] = {}
+        self.rediscovered_at = 0.0
+        self.rediscovering = False
+        self.last_sample = 0.0
         self.client_factory = client_factory
         self.log = get_log()
         self.cfg = config.load()
@@ -53,12 +85,13 @@ class Worker:
         self.cfg_mtime = config.mtime()
 
     def printers(self) -> Dict[str, Dict[str, Any]]:
-        return {p["id"]: p for p in self.cfg.get("printers") or []}
+        return {p["id"]: p for p in config.effective_printers(self.cfg)}
 
     # --- one round ---------------------------------------------------------------------------
 
     def step(self) -> None:
         self.reload_config()
+        self.sample_connections()
         token = self.cfg.get("deviceToken")
         if token and not self.cfg.get("supabaseUrl"):
             try:  # a new --site, or a config from an older version: read the server details again
@@ -160,35 +193,94 @@ class Worker:
             order = job.get("order") or {}
             reason = job.get("reason") or "new"
             try:
-                payload = self.ticket_payload(job, printer, restaurant)
-                status = self.send(printer["host"], int(printer.get("port") or 9100), payload, kind="star" if escpos.kind(printer) == "star" else "escpos")
+                tickets = self.ticket_lines(job, printer, restaurant)
+                status = deliver(printer, tickets, sender=self.send, who_uses=self.who_uses, title=f"XOrdering #{order.get('number') or 'test'}")
             except PrinterError as e:
                 attempts = self.store.mark_failed(row["id"], str(e))
                 down.add(pid)
                 if self.printer_state.get(pid, {}).get("ok", True) or attempts == 1:
-                    self.log.warning("printer %s (%s): %s; order #%s waits (attempt %s)", printer.get("name"), printer.get("host"), e, order.get("number"), attempts)
-                self.printer_state[pid] = {"ok": False, "error": str(e), "code": getattr(e, "code", "error"), "at": time.time()}
+                    self.log.warning("printer %s (%s): %s; order #%s waits (attempt %s)", printer.get("name"), describe_printer(printer), e, order.get("number"), attempts)
+                self.printer_failed(pid, printer, e)
                 continue
             except Exception as e:  # a ticket that can't be laid out must not stop the others
                 self.log.exception("ticket for order #%s failed", order.get("number"))
                 self.store.mark_failed(row["id"], f"ticket error: {e}")
                 continue
             self.store.mark_printed(row["id"])
+            if (status or {}).get("fallback") and printer.get("windowsMethod") != "driver":
+                self.log.info("printer %s: the driver refuses raw jobs (%s); printing pictures through the driver from now on", printer.get("name"), status["fallback"])
+                self.cfg = config.set_local(pid, windowsMethod="driver")
+                self.cfg_mtime = config.mtime()
             was_down = not self.printer_state.get(pid, {}).get("ok", True)
-            self.printer_state[pid] = {"ok": True, "error": None, "at": time.time(), "paperLow": bool((status or {}).get("paperLow"))}
+            self.failing.pop(pid, None)
+            self.printer_state[pid] = {"ok": True, "error": None, "at": time.time(), "paperLow": bool((status or {}).get("paperLow")), "method": (status or {}).get("method")}
             self.log.info("printed %s on %s%s", f"order #{order.get('number')}" if order else "the test page", printer.get("name"), "" if reason == "new" else f" ({reason})")
             if was_down:
                 self.log.info("printer %s is back", printer.get("name"))
                 self.store.retry_printer_now(pid)
 
     @staticmethod
-    def ticket_payload(job: Dict[str, Any], printer: Dict[str, Any], restaurant: Dict[str, Any]) -> bytes:
+    def ticket_lines(job: Dict[str, Any], printer: Dict[str, Any], restaurant: Dict[str, Any]) -> List[List[ticket.Line]]:
         reason = job.get("reason") or "new"
         order = job.get("order")
         if reason == "test" or not order:
-            return escpos.tickets_bytes(ticket.test_tickets(restaurant), printer)
-        lines = ticket.build(order, restaurant, reason=reason)
-        return escpos.ticket_bytes(lines, printer)
+            return ticket.test_tickets(restaurant)
+        return [ticket.build(order, restaurant, reason=reason)]
+
+    @classmethod
+    def ticket_payload(cls, job: Dict[str, Any], printer: Dict[str, Any], restaurant: Dict[str, Any]) -> bytes:
+        return escpos.tickets_bytes(cls.ticket_lines(job, printer, restaurant), printer)
+
+    # --- printers that keep failing --------------------------------------------------------
+
+    def printer_failed(self, pid: str, printer: Dict[str, Any], e: PrinterError) -> None:
+        now = time.time()
+        f = self.failing.setdefault(pid, {"since": now, "count": 0})
+        f["count"] += 1
+        stuck = now - f["since"] >= STUCK_AFTER and f["count"] >= STUCK_ATTEMPTS
+        was_stuck = bool(self.printer_state.get(pid, {}).get("stuck"))
+        self.printer_state[pid] = {"ok": False, "error": str(e), "code": getattr(e, "code", "error"), "at": now,
+                                   "failingSince": f["since"], "attempts": int(f["count"]), "stuck": stuck, "connection": printer.get("connection", "tcp")}
+        if stuck and not was_stuck:
+            self.log.warning("printer %s has failed for %d min (%s); looking for printers again", printer.get("name"), (now - f["since"]) // 60, e)
+            self.start_rediscovery()
+
+    def start_rediscovery(self, force: bool = False) -> bool:
+        """Looks for the printers again in the background (discovery.json), at most every 30 min."""
+        if self.rediscovering or (not force and time.time() - self.rediscovered_at < REDISCOVER_EVERY):
+            return False
+        self.rediscovering = True
+        self.rediscovered_at = time.time()
+
+        def work() -> None:
+            try:
+                res = self.rediscover_fn()
+                res["reason"] = "printing kept failing"
+                tmp = str(discovery_path()) + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(res, fh, ensure_ascii=False)
+                os.replace(tmp, discovery_path())
+                top = [f"{c['name']} ({discover.address_text(c)}, {discover.source_text(c)})" for c in discover.receipt_printers(res.get("candidates") or [])[:3]]
+                self.log.info("printers found again: %s", "; ".join(top) or "none")
+            except Exception:
+                self.log.exception("looking for printers again failed")
+            finally:
+                self.rediscovering = False
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def sample_connections(self) -> None:
+        """Notes which programs connect to printer ports (the POS prints only now and then)."""
+        if time.time() - self.last_sample < CONNECTION_SAMPLE:
+            return
+        self.last_sample = time.time()
+        try:
+            conns = discover.printer_connections()
+            if conns:
+                discover.remember_connections(conns)
+        except Exception as e:
+            self.log.debug("connection sample failed: %s", e)
 
     def upload_preview(self, client: api.Client, token: str) -> None:
         """The dashboard asked for a preview: the sample tickets, drawn exactly as they print."""
@@ -208,7 +300,7 @@ class Worker:
     def status_payload(self) -> Dict[str, Any]:
         printers = {}
         for pid, st in self.printer_state.items():
-            printers[pid] = {"ok": bool(st.get("ok")), "error": st.get("error"), "code": st.get("code"), "paperLow": bool(st.get("paperLow"))}
+            printers[pid] = {"ok": bool(st.get("ok")), "error": st.get("error"), "code": st.get("code"), "paperLow": bool(st.get("paperLow")), "stuck": bool(st.get("stuck"))}
         return {"version": VERSION, "printers": printers, "queue": self.store.counts()}
 
     def send_status(self, client: api.Client, token: str) -> None:
@@ -259,6 +351,7 @@ class Worker:
             "lastError": self.last_error,
             "printers": self.printer_state,
             "queue": self.store.counts(),
+            "rediscovery": {"running": self.rediscovering, "at": self.rediscovered_at or None},
         }
         tmp = str(status_path()) + ".tmp"
         try:

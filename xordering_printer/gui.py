@@ -1,8 +1,10 @@
 """The setup and status window (tkinter, built into Python: nothing to install).
 
-First run: connect this computer (a device key, recommended, or the owner's email sign-in), check the printers'
-IP addresses and print a test page. Afterwards it shows whether printing is working. Closing the
-window doesn't stop printing: the background service keeps going.
+First run: connect this computer (a device key, recommended, or the owner's email sign-in); with no
+printer set up yet, the printer window opens by itself and looks for printers (Windows printers, the
+POS's connections, the network, USB). Afterwards it shows whether printing is working, with a red
+warning when a printer keeps failing. Closing the window doesn't stop printing: the background
+service keeps going.
 """
 import json
 import os
@@ -15,7 +17,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Dict, List, Optional
 
-from . import APP_TITLE, VERSION, api, config, setup
+from . import APP_TITLE, VERSION, api, config, discover, setup, winprint
+from .deliver import describe as describe_connection
 from .paths import IS_WINDOWS, log_dir, status_path
 from .printer import PrinterError
 
@@ -66,13 +69,17 @@ class App:
         self.body = ttk.Frame(root, padding=16)
         self.body.pack(fill="both", expand=True)
         self.view = ""
+        self.auto_opened = False
+        self.dialog: Optional["PrinterDialog"] = None
         self.render()
         root.after(200, self._drain)
         root.after(1500, self._tick)
 
     # --- background calls ----------------------------------------------------------------
 
-    def bg(self, fn: Callable[[], Any], ok: Callable[[Any], None], button: Optional[ttk.Button] = None) -> None:
+    def bg(self, fn: Callable[[], Any], ok: Callable[[Any], None], button: Optional[ttk.Button] = None, quiet: bool = False,
+           error: Optional[Callable[[BaseException], None]] = None) -> None:
+        """Runs fn in a thread (the window never freezes); ok(result) back on the window's thread."""
         if button is not None:
             button.state(["disabled"])
 
@@ -82,7 +89,10 @@ class App:
                 self.results.put(lambda: ok(value))
             except Exception as e:  # shown to the user, logged by the caller's module
                 err = e
-                self.results.put(lambda: messagebox.showerror(APP_TITLE, explain(err), parent=self.root))
+                if error is not None:
+                    self.results.put(lambda: error(err))
+                elif not quiet:
+                    self.results.put(lambda: messagebox.showerror(APP_TITLE, explain(err), parent=self.root))
             finally:
                 if button is not None:
                     self.results.put(lambda: button.winfo_exists() and button.state(["!disabled"]))
@@ -230,7 +240,7 @@ class App:
 
     def connected(self) -> None:
         self.session = None
-        self.bg(setup.refresh, lambda _: self.render())
+        self.bg(setup.refresh, lambda _: self.render(), error=lambda _e: self.render())
 
     @staticmethod
     def _name(value: Any) -> str:
@@ -244,13 +254,20 @@ class App:
         self.status_label.pack(anchor="w", pady=(6, 2))
         self.queue_label = ttk.Label(self.body, foreground="#555")
         self.queue_label.pack(anchor="w")
+        # A printer that keeps failing: a red warning with the fix.
+        self.alert = tk.Frame(self.body, bg="#fde8e6", padx=10, pady=8)
+        self.alert_text = tk.Label(self.alert, bg="#fde8e6", fg="#8c1d18", justify="left", anchor="w", wraplength=440, font=("Microsoft YaHei UI" if IS_WINDOWS else "TkDefaultFont", 10, "bold"))
+        self.alert_text.pack(side="left", fill="x", expand=True)
+        self.alert_btn = ttk.Button(self.alert, text="修复 Fix", command=self.fix_stuck)
+        self.alert_btn.pack(side="right")
+        self.alert_shown = False
 
         box = ttk.LabelFrame(self.body, text=" 打印机 Printers ", padding=10)
         box.pack(fill="both", expand=True, pady=(14, 8))
         cols = ("name", "host", "paper", "mode", "state")
         self.status_cols = cols
         self.tree = ttk.Treeview(box, columns=cols, show="headings", height=6, selectmode="browse")
-        for c, title, w in zip(cols, ("名称 Name", "IP 地址 Address", "纸宽 Paper", "类型 Type", "状态 Status"), (110, 130, 60, 110, 150)):
+        for c, title, w in zip(cols, ("名称 Name", "连接 Connection", "纸宽 Paper", "类型 Type", "状态 Status"), (100, 150, 55, 100, 150)):
             self.tree.heading(c, text=title)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="both", expand=True)
@@ -259,7 +276,7 @@ class App:
         buttons.pack(fill="x", pady=(8, 0))
         ttk.Button(buttons, text="添加 Add", command=lambda: self.edit_printer(new=True)).pack(side="left")
         ttk.Button(buttons, text="修改 Edit", command=self.edit_printer).pack(side="left", padx=6)
-        self.conn_btn = ttk.Button(buttons, text="测试连接 Test connection", command=self.test_connection)
+        self.conn_btn = ttk.Button(buttons, text="测试连接 Test", command=self.test_connection)
         self.conn_btn.pack(side="left")
         self.test_btn = ttk.Button(buttons, text="打印测试页 Test page", command=self.test_print)
         self.test_btn.pack(side="left", padx=6)
@@ -267,14 +284,19 @@ class App:
         self.preview_btn.pack(side="left")
         self.conn_label = tk.Label(box, text="", anchor="w", justify="left", wraplength=520)
         self.conn_label.pack(anchor="w", pady=(6, 0))
-        ttk.Label(box, wraplength=520, foreground="#555", text="每台开启的打印机都会打印完整订单。IP 地址在打印机自检页上（多数机型：按住 FEED 键开机）。建议在路由器上给打印机设固定 IP（DHCP 保留），以免 IP 变了打不出来。\nEach enabled printer prints the whole order. The IP address is on the printer's self-test page (hold FEED while switching on). Give the printer a fixed IP on the router (DHCP reservation) so it doesn't change.").pack(anchor="w", pady=(8, 0))
+        ttk.Label(box, wraplength=520, foreground="#555", text="每台开启的打印机都会打印完整订单。“添加 / 修改”会自动查找打印机。网络打印机建议在路由器上设固定 IP（DHCP 保留）。\nEach enabled printer prints the whole order. Add / Edit look for printers by themselves. Give a network printer a fixed IP on the router (DHCP reservation).").pack(anchor="w", pady=(8, 0))
 
         foot = ttk.Frame(self.body)
         foot.pack(fill="x", pady=(6, 0))
         ttk.Button(foot, text="打开日志 Logs", command=self.open_logs).pack(side="left")
+        ttk.Button(foot, text="诊断报告 Diagnostics", command=lambda: ReportWindow(self, self.root, None)).pack(side="left", padx=(6, 0))
         ttk.Button(foot, text="断开此电脑 Disconnect", command=self.disconnect).pack(side="left", padx=6)
         ttk.Label(self.body, wraplength=540, foreground="#777", text=f"关闭此窗口后打印会在后台继续，开机自动运行。Printing continues in the background after you close this window, and starts with Windows.   v{VERSION}").pack(anchor="w", pady=(10, 0))
         self.update_status()
+        if not cfg.get("printers") and not self.auto_opened:
+            # First run: no printer yet. Open the printer window, which starts looking for printers.
+            self.auto_opened = True
+            self.root.after(300, lambda: self.edit_printer(new=True))
 
     def update_status(self) -> None:
         cfg = config.load()
@@ -305,44 +327,86 @@ class App:
         printer_state = st.get("printers") or {}
         selected = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
-        for p in cfg.get("printers") or []:
+        printers = config.effective_printers(cfg)
+        for p in printers:
             ps = printer_state.get(p["id"]) or {}
             s = "已关闭 Off" if not p.get("enabled", True) else "● 正常 OK" if ps.get("ok") else f"● {ps.get('error')}" if ps.get("error") else "—"
             if ps.get("ok") and ps.get("paperLow"):
                 s = "● 纸快用完 Paper low"
-            self.tree.insert("", "end", iid=p["id"], values=(p.get("name"), f"{p.get('host')}:{p.get('port', 9100)}", f"{80 if p.get('render') == 'star' else p.get('paperWidth', 80)} mm", MODES.get(p.get("render") or "text", ""), s))
+            where = f"Windows: {p.get('windowsPrinter')}" if p.get("connection") == "windows" else f"{p.get('host')}:{p.get('port', 9100)}"
+            self.tree.insert("", "end", iid=p["id"], values=(p.get("name"), where, f"{80 if p.get('render') == 'star' else p.get('paperWidth', 80)} mm", MODES.get(p.get("render") or "text", ""), s))
+        self.show_alert(printers, printer_state if fresh else {}, st.get("queue") or {})
         for iid in selected:
             if self.tree.exists(iid):
                 self.tree.selection_set(iid)
         if not self.tree.selection() and self.tree.get_children():
             self.tree.selection_set(self.tree.get_children()[0])
 
+    def show_alert(self, printers: List[Dict[str, Any]], state: Dict[str, Any], queue: Dict[str, Any]) -> None:
+        stuck = [(p, state[p["id"]]) for p in printers if p.get("enabled", True) and (state.get(p["id"]) or {}).get("stuck")]
+        if not stuck:
+            if self.alert_shown:
+                self.alert.pack_forget()
+                self.alert_shown = False
+            return
+        p, ps = stuck[0]
+        minutes = max(1, int((time.time() - float(ps.get("failingSince") or time.time())) // 60))
+        waiting = queue.get("queued", 0)
+        tip = ("建议改用“Windows 已安装的打印机”方式（点“修复”）。Tip: switch to the Windows printer connection (Fix)."
+               if p.get("connection") != "windows" else "请检查打印机电源、纸和线，或点“修复”重新侦测。Check power, paper and cable, or press Fix to look for it again.")
+        self.alert_text.configure(text=f"⚠ {p.get('name')} 已经 {minutes} 分钟打不出来 hasn't printed for {minutes} min: {ps.get('error')}\n"
+                                       f"{waiting} 张订单在排队，不会丢失，打印机恢复后自动补打。{waiting} ticket(s) wait and print once it works again.\n{tip}")
+        self.alert_stuck_id = p["id"]
+        if not self.alert_shown:
+            self.alert.pack(fill="x", pady=(8, 0), after=self.queue_label)
+            self.alert_shown = True
+
+    def fix_stuck(self) -> None:
+        pid = getattr(self, "alert_stuck_id", None)
+        printer = next((p for p in config.effective_printers(config.load()) if p["id"] == pid), None)
+        if printer is None:
+            return
+        last = setup.last_discovery()
+        fresh = last if last and time.time() - float(last.get("at") or 0) < 1800 else None
+        self.open_dialog(printer, discovery=fresh, autodetect=fresh is None)
+
     def selected_printer(self) -> Optional[Dict[str, Any]]:
         sel = self.tree.selection()
-        return next((p for p in config.load().get("printers") or [] if sel and p["id"] == sel[0]), None)
+        return next((p for p in config.effective_printers(config.load()) if sel and p["id"] == sel[0]), None)
 
     def edit_printer(self, new: bool = False) -> None:
         cfg = config.load()
         printer = None if new else self.selected_printer()
         if printer is None:
             n = len(cfg.get("printers") or []) + 1
-            printer = {"name": f"后厨 Kitchen {n}", "host": "", "port": 9100, "paperWidth": 80, "render": "star", "enabled": True}
-        PrinterDialog(self, printer)
+            printer = {"name": f"后厨 Kitchen {n}", "host": "", "port": 9100, "paperWidth": 80, "render": "star", "enabled": True,
+                       "connection": "windows" if IS_WINDOWS else "tcp"}
+        self.open_dialog(printer)
+
+    def open_dialog(self, printer: Dict[str, Any], discovery: Optional[Dict[str, Any]] = None, autodetect: bool = True) -> None:
+        if self.dialog is not None and self.dialog.top.winfo_exists():
+            self.dialog.top.lift()
+            return
+        self.dialog = PrinterDialog(self, printer, discovery=discovery, autodetect=autodetect)
 
     def test_print(self) -> None:
         p = self.selected_printer()
         if not p:
             messagebox.showinfo(APP_TITLE, "请先选择或添加打印机。Select or add a printer first.", parent=self.root)
             return
-        self.bg(lambda: setup.test_print(p), lambda _: messagebox.showinfo(APP_TITLE, f"已发送测试页到 {p['name']}（两张：普通单和预约单）。\nTest page sent to {p['name']} (two tickets: ASAP and scheduled).\n\n打不出来？Star TSP100 系列请选“Star 光栅”；中文乱码请选“图片”。\nNothing printed? Star TSP100: choose Star raster. Garbled Chinese: choose Picture.", parent=self.root), self.test_btn)
+        def failed(e: BaseException) -> None:
+            text = explain_printer_error(e) if isinstance(e, PrinterError) else explain(e)
+            messagebox.showerror(APP_TITLE, f"测试页没有打出来 The test page didn't print:\n\n{text}", parent=self.root)
+
+        self.bg(lambda: setup.test_print(p), lambda _: messagebox.showinfo(APP_TITLE, f"已发送测试页到 {p['name']}（两张：普通单和预约单）。\nTest page sent to {p['name']} (two tickets: ASAP and scheduled).\n\n打不出来？Star TSP100 系列请选“Star 光栅”；中文乱码请选“图片”。\nNothing printed? Star TSP100: choose Star raster. Garbled Chinese: choose Picture.", parent=self.root), self.test_btn, error=failed)
 
     def test_connection(self) -> None:
         p = self.selected_printer()
         if not p:
             messagebox.showinfo(APP_TITLE, "请先选择或添加打印机。Select or add a printer first.", parent=self.root)
             return
-        self.conn_label.configure(text="正在连接 Connecting…", fg="#555")
-        run_probe(self, p.get("host", ""), p.get("port", 9100), p.get("render", "text"), self.conn_label, self.conn_btn)
+        self.conn_label.configure(text=f"正在打印测试小票 Printing a test ticket ({describe_connection(p)})…", fg="#555")
+        run_probe(self, p, self.conn_label, self.conn_btn)
 
     def preview(self) -> None:
         def opened(path: str) -> None:
@@ -367,50 +431,141 @@ class App:
 
 
 class PrinterDialog:
-    def __init__(self, app: App, printer: Dict[str, Any]) -> None:
+    """One printer's settings, with the printers this computer can find listed beside them.
+
+    Opening it starts looking for printers in the background (discover.run): the list fills in with
+    each step's progress and the window stays usable. A single real receipt printer found for a new
+    printer is picked and filled in by itself: the user only presses Test connection and Save.
+    """
+
+    def __init__(self, app: App, printer: Dict[str, Any], discovery: Optional[Dict[str, Any]] = None, autodetect: bool = True) -> None:
         self.app = app
         self.printer = printer
+        self.is_new = not printer.get("id")
+        self.discovery: Optional[Dict[str, Any]] = None
+        self.candidates: List[Dict[str, Any]] = []
+        self.searching = False
+        self.touched = False
+        self.auto_key: Optional[str] = None
+        self.win_printers: List[Dict[str, Any]] = []
         top = self.top = tk.Toplevel(app.root)
         top.title("打印机 Printer")
         top.transient(app.root)
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        top.geometry(f"{min(960, sw - 40)}x{min(660, sh - 80)}")
+        top.minsize(min(760, sw - 40), min(520, sh - 80))
         top.grab_set()
-        f = ttk.Frame(top, padding=16)
-        f.pack(fill="both", expand=True)
-        self.name = self._entry(f, "名称 Name", printer.get("name", ""), 0)
-        self.host = self._entry(f, "IP 地址 IP address (192.168.x.x)", printer.get("host", ""), 2)
-        self.port = self._entry(f, "端口 Port", str(printer.get("port", 9100)), 4)
-        tools = ttk.Frame(f)
-        tools.grid(row=3, column=1, sticky="nw", padx=(8, 0))
-        self.scan_btn = ttk.Button(tools, text="扫描打印机 Scan", command=self.scan)
-        self.scan_btn.pack(side="left")
-        self.probe_btn = ttk.Button(tools, text="测试连接 Test connection", command=self.probe)
-        self.probe_btn.pack(side="left", padx=(6, 0))
-        self.found = tk.Listbox(f, height=4)
-        self.found.grid(row=4, column=1, rowspan=7, sticky="nwe", padx=(8, 0), pady=(6, 0))
-        self.found.bind("<<ListboxSelect>>", self.pick_found)
-        self.result = tk.Label(f, text="建议在路由器上给打印机设固定 IP。\nTip: give the printer a fixed IP on the router.", anchor="w", justify="left", fg="#555", wraplength=260)
-        self.result.grid(row=11, column=1, sticky="nw", padx=(8, 0), pady=(6, 0))
+        outer = ttk.Frame(top, padding=14)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=0)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        # --- left: the settings ---
+        f = ttk.Frame(outer)
+        f.grid(row=0, column=0, sticky="nsw", padx=(0, 14))
+        ttk.Label(f, text="名称 Name").pack(anchor="w")
+        self.name = ttk.Entry(f, width=34)
+        self.name.insert(0, printer.get("name", ""))
+        self.name.pack(anchor="w", fill="x", pady=(2, 8))
+
+        ttk.Label(f, text="连接方式 Connection").pack(anchor="w")
+        self.connection = tk.StringVar(value="windows" if printer.get("connection") == "windows" else "tcp")
+        for value, label in (("windows", "Windows 已安装的打印机 Windows printer"), ("tcp", "网络 IP 直连 Network IP (direct)")):
+            ttk.Radiobutton(f, text=label, value=value, variable=self.connection, command=self.sync_connection).pack(anchor="w")
+
+        self.conn_box = ttk.Frame(f)
+        self.conn_box.pack(fill="x", pady=(6, 8))
+        # Windows printer
+        self.win_frame = ttk.Frame(self.conn_box)
+        ttk.Label(self.win_frame, text="Windows 打印机 Windows printer").pack(anchor="w")
+        self.win_name = ttk.Combobox(self.win_frame, width=34, values=[printer.get("windowsPrinter")] if printer.get("windowsPrinter") else [])
+        self.win_name.set(printer.get("windowsPrinter", ""))
+        self.win_name.pack(anchor="w", fill="x", pady=(2, 2))
+        self.win_name.bind("<<ComboboxSelected>>", lambda _e: self.on_windows_printer())
+        self.win_info = ttk.Label(self.win_frame, foreground="#555", wraplength=300, text="")
+        self.win_info.pack(anchor="w")
+        self.to_ip_btn = ttk.Button(self.win_frame, text="改为直连 IP Use its IP directly", command=self.use_ip_directly)
+        # Network IP
+        self.tcp_frame = ttk.Frame(self.conn_box)
+        ttk.Label(self.tcp_frame, text="IP 地址 IP address (192.168.x.x)").pack(anchor="w")
+        self.host = ttk.Entry(self.tcp_frame, width=34)
+        self.host.insert(0, printer.get("host", "") if printer.get("connection") != "windows" else "")
+        self.host.pack(anchor="w", fill="x", pady=(2, 4))
+        ttk.Label(self.tcp_frame, text="端口 Port").pack(anchor="w")
+        self.port = ttk.Entry(self.tcp_frame, width=10)
+        self.port.insert(0, str(printer.get("port", 9100)))
+        self.port.pack(anchor="w", pady=(2, 0))
+
+        ttk.Label(f, text="打印机类型 Printer type").pack(anchor="w")
         self.render = tk.StringVar(value=printer.get("render", "star"))
-        ttk.Label(f, text="打印机类型 Printer type").grid(row=6, column=0, sticky="w", pady=(8, 0))
-        rr = ttk.Frame(f)
-        rr.grid(row=7, column=0, sticky="w")
         for value, label in (("star", "Star 光栅 (TSP100III / TSP143)"), ("image", "ESC/POS 图片 Picture"), ("text", "ESC/POS 文字 Text (GBK)")):
-            ttk.Radiobutton(rr, text=label, value=value, variable=self.render, command=self.sync_paper).pack(anchor="w")
+            ttk.Radiobutton(f, text=label, value=value, variable=self.render, command=self.sync_paper).pack(anchor="w")
+        ttk.Label(f, text="纸宽 Paper width").pack(anchor="w", pady=(6, 0))
         self.paper = tk.StringVar(value=str(printer.get("paperWidth", 80)))
-        ttk.Label(f, text="纸宽 Paper width").grid(row=8, column=0, sticky="w", pady=(8, 0))
         pr = ttk.Frame(f)
-        pr.grid(row=9, column=0, sticky="w")
+        pr.pack(anchor="w")
         self.paper_buttons = [ttk.Radiobutton(pr, text=f"{v} mm", value=v, variable=self.paper) for v in ("80", "58")]
         for btn in self.paper_buttons:
             btn.pack(side="left", padx=(0, 10))
-        self.sync_paper()
         self.enabled = tk.BooleanVar(value=bool(printer.get("enabled", True)))
-        ttk.Checkbutton(f, text="打印新订单 Print new orders", variable=self.enabled).grid(row=10, column=0, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(f, text="打印新订单 Print new orders", variable=self.enabled).pack(anchor="w", pady=(8, 0))
+
+        self.probe_btn = ttk.Button(f, text="测试连接（打印一张测试小票）Test connection", command=self.probe)
+        self.probe_btn.pack(anchor="w", fill="x", pady=(12, 4))
+        self.result = tk.Label(f, text="", anchor="w", justify="left", fg="#555", wraplength=320)
+        self.result.pack(anchor="w", fill="x")
         b = ttk.Frame(f)
-        b.grid(row=12, column=0, columnspan=2, sticky="we", pady=(16, 0))
+        b.pack(anchor="w", pady=(10, 0))
         self.save_btn = ttk.Button(b, text="保存 Save", command=self.save)
         self.save_btn.pack(side="left")
         ttk.Button(b, text="取消 Cancel", command=top.destroy).pack(side="left", padx=6)
+
+        # --- right: what was found ---
+        r = ttk.LabelFrame(outer, text=" 找到的打印机 Printers found ", padding=10)
+        r.grid(row=0, column=1, sticky="nsew")
+        r.columnconfigure(0, weight=1)
+        r.rowconfigure(2, weight=1)
+        self.search_label = tk.Label(r, text="", anchor="w", justify="left", fg="#555", wraplength=520)
+        self.search_label.grid(row=0, column=0, sticky="we")
+        self.bar = ttk.Progressbar(r, mode="determinate", maximum=len(discover.STEPS))
+        self.bar.grid(row=1, column=0, sticky="we", pady=(4, 6))
+        cols = ("printer", "address", "source")
+        self.found = ttk.Treeview(r, columns=cols, show="headings", height=8, selectmode="browse")
+        for c, title, w in zip(cols, ("打印机 Printer", "地址 Address", "来源 Found as"), (200, 120, 200)):
+            self.found.heading(c, text=title)
+            self.found.column(c, width=w, anchor="w")
+        self.found.tag_configure("best", background="#e9f6ec")
+        self.found.tag_configure("dim", foreground="#888")
+        self.found.grid(row=2, column=0, sticky="nsew")
+        self.found.bind("<<TreeviewSelect>>", lambda _e: self.pick_found())
+        tools = ttk.Frame(r)
+        tools.grid(row=3, column=0, sticky="we", pady=(8, 0))
+        self.search_btn = ttk.Button(tools, text="重新侦测 Detect again", command=self.search)
+        self.search_btn.pack(side="left")
+        ttk.Button(tools, text="诊断报告 Diagnostics", command=self.show_report).pack(side="left", padx=6)
+        ttk.Label(r, wraplength=520, foreground="#666", text="点选一台即可填好设置。网络打印机建议在路由器上设固定 IP。\nClick one to fill in its settings. Give a network printer a fixed IP on the router.").grid(row=4, column=0, sticky="w", pady=(8, 0))
+
+        for w in (self.name, self.host, self.port, self.win_name):
+            w.bind("<Key>", lambda _e: self.mark_touched())
+        self.sync_connection()
+        self.sync_paper()
+        self.load_windows_printers()
+        if discovery:
+            self.show_found(discovery)
+        if autodetect:
+            self.search()
+
+    # --- form ---
+
+    def mark_touched(self) -> None:
+        self.touched = True
+
+    def sync_connection(self) -> None:
+        self.win_frame.pack_forget()
+        self.tcp_frame.pack_forget()
+        (self.win_frame if self.connection.get() == "windows" else self.tcp_frame).pack(fill="x")
+        self.on_windows_printer()
 
     def sync_paper(self) -> None:
         star = self.render.get() == "star"
@@ -419,55 +574,199 @@ class PrinterDialog:
         for btn in self.paper_buttons:
             btn.state(["disabled"] if star else ["!disabled"])
 
-    def scan(self) -> None:
-        self.found.delete(0, "end")
-        self.found.insert("end", "正在扫描 Scanning…")
-        self.result.configure(text="正在扫描局域网（约 10 秒）Scanning the network (about 10 s)…", fg="#555")
+    def win_printer_info(self, name: str) -> Optional[Dict[str, Any]]:
+        return next((p for p in self.win_printers if p["name"] == name), None)
 
-        def done(ips: List[str]) -> None:
-            self.found.delete(0, "end")
-            for ip in ips:
-                self.found.insert("end", ip)
-            if ips:
-                self.result.configure(text=f"找到 {len(ips)} 台，点选一个填入 Found {len(ips)}: click one to use it", fg="#1b7f3b")
-            else:
-                self.result.configure(text="没找到开放 9100 端口的设备。打印机开机并插好网线了吗？\nNothing with port 9100 open. Is the printer on and cabled?", fg="#b3261e")
-
-        try:
-            port = int(self.port.get().strip() or "9100")
-        except ValueError:
-            port = 9100
-        self.app.bg(lambda: setup.find_printers(port), done, self.scan_btn)
-
-    def pick_found(self, _e: Any = None) -> None:
-        sel = self.found.curselection()
-        if not sel:
+    def on_windows_printer(self) -> None:
+        info = self.win_printer_info(self.win_name.get())
+        self.to_ip_btn.pack_forget()
+        if not info:
+            self.win_info.configure(text="")
             return
-        ip = self.found.get(sel[0])
-        if not ip[:1].isdigit():
+        where = f"{info['ip']}:{info.get('tcpPort') or 9100}" if info.get("ip") else info.get("port", "")
+        self.win_info.configure(text=f"驱动 Driver: {info.get('driver', '')}\n端口 Port: {where}" + (f"\n状态 Status: {info['status']}" if info.get("status") else ""))
+        if info.get("ip"):
+            self.to_ip_btn.pack(anchor="w", pady=(4, 0))
+
+    def use_ip_directly(self) -> None:
+        info = self.win_printer_info(self.win_name.get())
+        if not info or not info.get("ip"):
             return
         self.host.delete(0, "end")
-        self.host.insert(0, ip)
-        self.probe()
+        self.host.insert(0, info["ip"])
+        self.port.delete(0, "end")
+        self.port.insert(0, str(info.get("tcpPort") or 9100))
+        self.connection.set("tcp")
+        self.sync_connection()
+        self.result.configure(text=f"已改为直连 {info['ip']}:{info.get('tcpPort') or 9100}。请点“测试连接”。\nSwitched to the IP directly: press Test connection.", fg="#555")
 
-    def probe(self) -> None:
-        self.result.configure(text="正在连接 Connecting…", fg="#555")
-        run_probe(self.app, self.host.get(), self.port.get(), self.render.get(), self.result, self.probe_btn)
+    def load_windows_printers(self) -> None:
+        if not IS_WINDOWS:
+            return
 
-    def _entry(self, f: ttk.Frame, label: str, value: str, row: int) -> ttk.Entry:
-        ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=(8 if row else 0, 0))
-        e = ttk.Entry(f, width=36)
-        e.insert(0, value)
-        e.grid(row=row + 1, column=0, sticky="we")
-        return e
+        def done(printers: List[Dict[str, Any]]) -> None:
+            if self.top.winfo_exists():
+                self.set_windows_printers(printers)
 
-    def save(self) -> None:
+        self.app.bg(lambda: winprint.list_printers(), done, quiet=True)
+
+    def set_windows_printers(self, printers: List[Dict[str, Any]]) -> None:
+        self.win_printers = [p for p in printers if not p.get("virtual")]
+        names = [p["name"] for p in sorted(self.win_printers, key=lambda p: (not discover.guess(p["name"] + " " + p.get("driver", ""))["receipt"], p["name"].lower()))]
+        current = self.win_name.get()
+        if current and current not in names:
+            names.insert(0, current)
+        self.win_name.configure(values=names)
+        self.on_windows_printer()
+
+    def form(self) -> Dict[str, Any]:
+        """The printer as filled in (not saved)."""
         try:
             port = int(self.port.get().strip() or "9100")
         except ValueError:
             port = -1
-        p = dict(self.printer, name=self.name.get().strip(), host=self.host.get().strip(), port=port, paperWidth=80 if self.render.get() == "star" else int(self.paper.get()), render=self.render.get(), enabled=self.enabled.get(), assignment=self.printer.get("assignment") or "full")
-        p = {k: v for k, v in p.items() if k in ("id", "name", "host", "port", "paperWidth", "render", "enabled", "assignment")}
+        windows = self.connection.get() == "windows"
+        win = self.win_printer_info(self.win_name.get()) or {}
+        host = (win.get("ip") or "") if windows else self.host.get().strip()
+        p = dict(self.printer, name=self.name.get().strip(), host=host, port=int(win.get("tcpPort") or 9100) if windows else port,
+                 paperWidth=80 if self.render.get() == "star" else int(self.paper.get()), render=self.render.get(), enabled=self.enabled.get(),
+                 assignment=self.printer.get("assignment") or "full", connection="windows" if windows else "tcp",
+                 windowsPrinter=self.win_name.get().strip() if windows else "")
+        if not windows or p["windowsPrinter"] != self.printer.get("windowsPrinter"):
+            p.pop("windowsMethod", None)
+        return p
+
+    def apply(self, c: Dict[str, Any], announce: str = "") -> None:
+        """Fills the form from a found printer."""
+        s = discover.settings_for(c)
+        if s["connection"] == "windows":
+            if s["windowsPrinter"] not in (self.win_name.cget("values") or ()):
+                self.win_name.configure(values=[s["windowsPrinter"], *(self.win_name.cget("values") or ())])
+            self.win_name.set(s["windowsPrinter"])
+            if not self.win_printer_info(s["windowsPrinter"]):
+                self.win_printers.append({"name": c["windowsPrinter"], "driver": c["driver"], "port": c["portName"], "ip": c["ip"], "tcpPort": c["port"] if c["ip"] else None, "status": c.get("winStatus", "")})
+        if s["host"]:
+            self.host.delete(0, "end")
+            self.host.insert(0, s["host"])
+            self.port.delete(0, "end")
+            self.port.insert(0, str(s["port"]))
+        if s["connection"]:
+            self.connection.set(s["connection"])
+        self.render.set(s["render"])
+        self.paper.set(str(s["paperWidth"]))
+        self.sync_connection()
+        self.sync_paper()
+        kind = MODES.get(s["render"], "")
+        text = announce or "已填入，请点“测试连接”再“保存”。Filled in: press Test connection, then Save."
+        self.result.configure(text=f"{c['name']} · {discover.address_text(c)} · {kind}\n{text}", fg="#1b5e20")
+
+    # --- finding printers ---
+
+    def search(self) -> None:
+        if self.searching:
+            return
+        self.searching = True
+        self.search_btn.state(["disabled"])
+        self.bar.configure(value=0)
+        self.search_label.configure(text="正在查找打印机… Looking for printers…", fg="#555")
+        if not self.candidates:
+            self.found.delete(*self.found.get_children())
+
+        def progress(step: int, total: int, text: str) -> None:
+            def show() -> None:
+                if self.top.winfo_exists():
+                    self.bar.configure(value=step - 1 + 0.5)
+                    self.search_label.configure(text=f"正在查找打印机… Looking for printers… ({step}/{total})\n{text}")
+            self.app.results.put(show)
+
+        def done(res: Dict[str, Any]) -> None:
+            self.searching = False
+            if not self.top.winfo_exists():
+                return
+            self.search_btn.state(["!disabled"])
+            self.bar.configure(value=len(discover.STEPS))
+            self.show_found(res, auto=True)
+
+        def failed(_e: BaseException) -> None:
+            self.searching = False
+            if self.top.winfo_exists():
+                self.search_btn.state(["!disabled"])
+                self.search_label.configure(text="查找出错，请点“诊断报告”。Looking for printers failed: see Diagnostics.", fg="#b3261e")
+
+        self.app.bg(lambda: setup.find_printers(progress), done, error=failed)
+
+    def show_found(self, res: Dict[str, Any], auto: bool = False) -> None:
+        self.discovery = res
+        self.candidates = res.get("candidates") or []
+        if res.get("windowsPrinters"):
+            self.set_windows_printers(res["windowsPrinters"])
+        receipt = discover.receipt_printers(self.candidates)
+        self.found.delete(*self.found.get_children())
+        for i, c in enumerate(self.candidates):
+            label = c["name"] + (f" ({c['brand']})" if c["brand"] and c["brand"].lower() not in c["name"].lower() else "")
+            tag = "best" if c in receipt[:1] else ("dim" if c not in receipt else "")
+            self.found.insert("", "end", iid=str(i), values=(label, discover.address_text(c), discover.source_text(c)), tags=(tag,) if tag else ())
+        n = len(receipt)
+        busy = [c for c in receipt if "in_use" in c["sources"]]
+        if n == 0:
+            self.search_label.configure(fg="#b3261e", text=(
+                "没有找到小票打印机。请确认打印机开机、插好网线或 USB；USB 打印机需要先在 Windows 里装好驱动。点“诊断报告”可以复制详细信息发给我们。\n"
+                "No receipt printer found. Is it on and cabled (network or USB)? A USB printer needs its Windows driver. Diagnostics has the details to send us."))
+        else:
+            extra = f"  {busy[0]['name']} 正被 {busy[0]['process'] or '其他程序'} 使用 (in use by {busy[0]['process'] or 'another program'})" if busy else ""
+            self.search_label.configure(fg="#1b7f3b", text=f"找到 {n} 台小票打印机（最像的排在最前）Found {n} receipt printer{'s' if n != 1 else ''}, best first.{extra}")
+        # Highlight the printer this one is set to, or the best match.
+        current = next((i for i, c in enumerate(self.candidates) if (self.printer.get("windowsPrinter") and c["windowsPrinter"] == self.printer.get("windowsPrinter"))
+                        or (self.printer.get("host") and c["ip"] == self.printer.get("host"))), None)
+        if current is not None:
+            self.found.selection_set(str(current))
+            self.found.see(str(current))
+        elif auto and self.is_new and not self.touched and n == 1 and not self.host.get().strip() and not self.win_name.get().strip():
+            idx = self.candidates.index(receipt[0])
+            self.auto_key = receipt[0]["key"]
+            self.found.selection_set(str(idx))
+            self.apply(receipt[0], "已自动选好并填好设置，请点“测试连接”，再点“保存”。\nPicked and filled in for you: press Test connection, then Save.")
+
+    def pick_found(self) -> None:
+        sel = self.found.selection()
+        if not sel:
+            return
+        c = self.candidates[int(sel[0])]
+        if c["key"] == self.auto_key:  # the selection made by the auto-pick itself: already filled in
+            self.auto_key = None
+            return
+        if not c["connection"]:
+            self.result.configure(text="这台 USB 打印机还没有 Windows 驱动：先安装打印机驱动，再点“重新侦测”。\nThis USB printer has no Windows driver yet: install it, then Detect again.", fg="#b3261e")
+            return
+        self.apply(c)
+
+    def show_report(self) -> None:
+        if self.discovery:
+            ReportWindow(self.app, self.top, setup.diagnostics(self.discovery))
+            return
+        ReportWindow(self.app, self.top, None)
+
+    # --- test, save ---
+
+    def probe(self) -> None:
+        p = self.form()
+        if p["connection"] == "tcp" and not p["host"]:
+            self.result.configure(text="请先填 IP 地址或选一台打印机。Enter the IP address or pick a printer first.", fg="#b3261e")
+            return
+        if p["connection"] == "windows" and not p["windowsPrinter"]:
+            self.result.configure(text="请先选择 Windows 打印机。Choose the Windows printer first.", fg="#b3261e")
+            return
+        self.result.configure(text="正在打印测试小票… Printing a test ticket…", fg="#555")
+        run_probe(self.app, p, self.result, self.probe_btn)
+
+    def save(self) -> None:
+        p = self.form()
+        if not p["name"]:
+            self.result.configure(text="请填名称。Enter a name.", fg="#b3261e")
+            return
+        if p["connection"] == "windows" and not p["windowsPrinter"]:
+            self.result.configure(text="请先选择 Windows 打印机。Choose the Windows printer first.", fg="#b3261e")
+            return
 
         def done(saved: Dict[str, Any]) -> None:
             self.top.destroy()
@@ -480,47 +779,109 @@ class PrinterDialog:
         self.app.bg(lambda: setup.save_printer(p), done, self.save_btn)
 
 
+class ReportWindow:
+    """The diagnostics report: everything the search found, to copy and send for remote help."""
+
+    def __init__(self, app: App, parent: tk.Misc, text: Optional[str]) -> None:
+        self.app = app
+        top = self.top = tk.Toplevel(parent)
+        top.title("诊断报告 Diagnostics")
+        top.transient(parent)
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        top.geometry(f"{min(820, sw - 60)}x{min(600, sh - 100)}")
+        f = ttk.Frame(top, padding=12)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, wraplength=760, text="把下面的内容复制后发给我们，方便远程排查（不含密钥）。\nCopy this and send it to us for remote help (it contains no keys).").pack(anchor="w")
+        body = ttk.Frame(f)
+        body.pack(fill="both", expand=True, pady=(8, 8))
+        self.text = tk.Text(body, wrap="none", font=("Consolas" if IS_WINDOWS else "Menlo", 9))
+        ys = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
+        xs = ttk.Scrollbar(body, orient="horizontal", command=self.text.xview)
+        self.text.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="we")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        row = ttk.Frame(f)
+        row.pack(fill="x")
+        self.copy_btn = ttk.Button(row, text="一键复制 Copy", command=self.copy)
+        self.copy_btn.pack(side="left")
+        self.note = ttk.Label(row, foreground="#555", text="")
+        self.note.pack(side="left", padx=10)
+        ttk.Button(row, text="关闭 Close", command=top.destroy).pack(side="right")
+        if text is None:
+            self.set_text("正在收集… Collecting… (5-20 s)")
+            self.copy_btn.state(["disabled"])
+            self.app.bg(lambda: setup.diagnostics(setup.find_printers()), self.loaded)
+        else:
+            self.set_text(text)
+
+    def loaded(self, text: str) -> None:
+        if self.top.winfo_exists():
+            self.set_text(text)
+            self.copy_btn.state(["!disabled"])
+
+    def set_text(self, text: str) -> None:
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", text)
+        self.text.configure(state="disabled")
+
+    def copy(self) -> None:
+        text = self.text.get("1.0", "end").rstrip()
+        self.top.clipboard_clear()
+        self.top.clipboard_append(text)
+        self.top.update()
+        from .paths import log_dir
+
+        self.note.configure(text=f"已复制 Copied ({len(text)} chars) · 也保存在 also saved to {log_dir() / 'diagnostics.txt'}")
+
+
 MODES = {"star": "Star 光栅 raster", "image": "图片 Picture", "text": "文字 Text"}
 PROBE_ERRORS = {
-    "timeout": "连接超时：打印机没开、IP 不对或不在同一网络。\nTimed out: printer off, wrong IP, or another network.",
-    "refused": "拒绝连接：端口不对，或打印机正在给别的设备（POS）出单，稍后再试。\nConnection refused: wrong port, or the printer is busy with another device (POS); try again.",
-    "unreachable": "无法到达：这台电脑和打印机不在同一网络。\nUnreachable: this computer and the printer aren't on the same network.",
+    "timeout": "打印机离线或 IP 不对（连接超时）：打印机没开机、IP 变了，或不在同一网络。\nPrinter offline or wrong IP (timed out): off, its IP changed, or another network.",
+    "refused": "端口被占用或不对（拒绝连接）：打印机可能正在给其他程序（POS）出单，或者端口不是 9100。\nPort busy or wrong (refused): the printer may be busy with another program (POS), or the port isn't 9100.",
+    "unreachable": "网段不对：这台电脑和打印机不在同一网络。\nWrong network: this computer can't reach the printer.",
+    "busy": "打印机断开了连接（可能正忙于其他程序）。\nThe printer dropped the connection (busy with another program?).",
+    "lost": "连接中断，小票没有送完。\nThe connection dropped before the ticket was sent.",
+    "cover_open": "打印机盖子开着。\nThe printer's cover is open.",
+    "paper_out": "打印机没纸了。\nThe printer is out of paper.",
+}
+HINTS = {
+    "in_use": "\n建议：改用“Windows 已安装的打印机”方式，和 POS 共用同一个驱动。\nTip: use the Windows printer connection to share the driver with the POS.",
+    "driver": "\n建议：在 Windows“打印机和扫描仪”里打印一张测试页确认驱动正常；或改用网络 IP 直连。\nTip: print a Windows test page from Printers & scanners to check the driver, or use the network IP.",
+    "not_found": "\n建议：点“重新侦测”选择现在的打印机。\nTip: press Detect again and choose the printer.",
 }
 
 
-def run_probe(app: "App", host: str, port: Any, render_kind: str, label: tk.Label, button: Optional[ttk.Button]) -> None:
-    """Test connection: green when the printer answers, red with the reason when it doesn't."""
-    host = (host or "").strip()
-    if not host:
-        label.configure(text="请先填 IP 地址。Enter the IP address first.", fg="#b3261e")
-        return
-    try:
-        port_n = int(str(port).strip() or "9100")
-    except ValueError:
-        port_n = 9100
+def explain_printer_error(e: PrinterError) -> str:
+    code = getattr(e, "code", "error")
+    base = str(e) if code in ("in_use", "wrong_subnet", "not_found", "driver", "paused", "spooler", "offline") else PROBE_ERRORS.get(code, str(e))
+    detail = f"\n({e})" if code in PROBE_ERRORS else ""
+    return base + detail + HINTS.get(code, "")
 
-    def ok(res: Dict[str, Any]) -> None:
-        st = res.get("status") or {}
-        extra = ""
-        if st.get("coverOpen"):
-            extra = "  ⚠ 盖子开着 cover open"
-        elif st.get("paperEmpty"):
-            extra = "  ⚠ 没纸了 out of paper"
-        elif st.get("paperLow"):
-            extra = "  · 纸快用完 paper low"
-        label.configure(text=f"● 已连接 Connected: {host}:{port_n} ({res.get('ms')} ms){extra}", fg="#b3261e" if ("⚠" in extra) else "#1b7f3b")
+
+def run_probe(app: "App", printer: Dict[str, Any], label: tk.Label, button: Optional[ttk.Button]) -> None:
+    """Test connection: prints a short test ticket; green when it went out, red with the reason."""
 
     def work() -> Dict[str, Any]:
         try:
-            return setup.test_connection(host, port_n, render_kind)
+            return setup.test_connection(printer)
         except PrinterError as e:
-            return {"error": PROBE_ERRORS.get(e.code, str(e))}
+            return {"error": explain_printer_error(e)}
 
     def show(res: Dict[str, Any]) -> None:
+        if not label.winfo_exists():
+            return
         if res.get("error"):
             label.configure(text=f"● {res['error']}", fg="#b3261e")
-        else:
-            ok(res)
+            return
+        st = res.get("status") or {}
+        extra = "  · 纸快用完 paper low" if st.get("paperLow") else ""
+        via = {"tcp": "IP 直连 network IP", "raw": "Windows 打印机 Windows printer", "driver": "Windows 驱动图片 picture through the driver"}.get(res.get("method") or "", "")
+        note = "\n（这台打印机的驱动不接受原始数据，已改用驱动打印图片 The driver refuses raw data: printing pictures through it）" if res.get("fallback") else ""
+        label.configure(text=f"● 已打印测试小票 Test ticket printed ({via}, {res.get('ms')} ms){extra}\n没出纸？请检查打印机类型。Nothing came out? Check the printer type.{note}", fg="#1b7f3b")
 
     app.bg(work, show, button)
 

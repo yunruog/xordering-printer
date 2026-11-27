@@ -77,6 +77,19 @@ def self_check() -> int:
         result.update(sizes=[list(i.size) for i in imgs], chineseInk=sum(1 for v in glyph.tobytes() if v < 128),
                       starBytes=len(data), starStart=data[:4].hex(), ok=True)
         result["ok"] = bool(result["bundledFont"] and result["chineseInk"] > 20 and data.startswith(star.INIT) and all(i.size[0] == 576 for i in imgs))
+        # Finding printers and Windows printer mode need these inside the exe.
+        import psutil  # noqa: F401
+
+        result["psutil"] = True
+        if sys.platform == "win32":
+            import win32print  # noqa: F401
+            import win32ui  # noqa: F401
+
+            from . import discover, winprint
+
+            result["windowsPrinters"] = [p["name"] for p in winprint.list_printers()]
+            result["interfaces"] = len(discover.interfaces())
+            result["pywin32"] = True
     except Exception as e:  # reported, not raised: the release step reads the file
         result.update(ok=False, error=f"{type(e).__name__}: {e}")
     (data_dir() / "self-check.json").write_text(json.dumps(result, indent=1), "utf-8")
