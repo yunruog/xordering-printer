@@ -275,11 +275,14 @@ class App:
         self.alert_btn.pack(side="right")
         self.alert_shown = False
 
+        # The footer is packed at the bottom first, so a red warning never pushes it out of the window.
+        bottom = ttk.Frame(self.body)
+        bottom.pack(side="bottom", fill="x")
         box = ttk.LabelFrame(self.body, text=" 打印机 Printers ", padding=10)
         box.pack(fill="both", expand=True, pady=(14, 8))
         cols = ("name", "host", "paper", "mode", "state")
         self.status_cols = cols
-        self.tree = ttk.Treeview(box, columns=cols, show="headings", height=6, selectmode="browse")
+        self.tree = ttk.Treeview(box, columns=cols, show="headings", height=3, selectmode="browse")
         for c, title, w in zip(cols, ("名称 Name", "连接 Connection", "纸宽 Paper", "类型 Type", "状态 Status"), (100, 150, 70, 110, 170)):
             self.tree.heading(c, text=title)
             self.tree.column(c, width=w, anchor="w")
@@ -299,14 +302,14 @@ class App:
         self.conn_label.pack(anchor="w", pady=(6, 0))
         ttk.Label(box, wraplength=520, foreground="#555", text="每台开启的打印机都会打印完整订单。“添加 / 修改”会自动查找打印机。网络打印机建议在路由器上设固定 IP（DHCP 保留）。\nEach enabled printer prints the whole order. Add / Edit look for printers by themselves. Give a network printer a fixed IP on the router (DHCP reservation).").pack(anchor="w", pady=(8, 0))
 
-        foot = ttk.Frame(self.body)
+        foot = ttk.Frame(bottom)
         foot.pack(fill="x", pady=(6, 0))
         ttk.Button(foot, text="打开日志 Logs", command=self.open_logs).pack(side="left")
         self.copy_btn = ttk.Button(foot, text="复制日志 Copy log", command=self.copy_log)
         self.copy_btn.pack(side="left", padx=(6, 0))
         ttk.Button(foot, text="诊断报告 Diagnostics", command=lambda: ReportWindow(self, self.root, None)).pack(side="left", padx=(6, 0))
         ttk.Button(foot, text="断开此电脑 Disconnect", command=self.disconnect).pack(side="left", padx=6)
-        ttk.Label(self.body, wraplength=540, foreground="#777", text=f"关闭此窗口后打印会在后台继续，开机自动运行。Printing continues in the background after you close this window, and starts with Windows.   v{VERSION}").pack(anchor="w", pady=(10, 0))
+        ttk.Label(bottom, wraplength=540, foreground="#777", text=f"关闭此窗口后打印会在后台继续，开机自动运行。Printing continues in the background after you close this window, and starts with Windows.   v{VERSION}").pack(anchor="w", pady=(10, 0))
         self.update_status()
         if not cfg.get("printers") and not self.auto_opened:
             # First run: no printer yet. Open the printer window, which starts looking for printers.
