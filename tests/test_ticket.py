@@ -50,6 +50,44 @@ class TicketTest(unittest.TestCase):
         self.assertLess(order_lines.index("TSUNAMI SUSHI"), order_lines.index("Order #1042"))
         self.assertNotIn("REPRINT", text)
 
+    def test_tax_rate_text(self):
+        self.assertEqual(ticket.rate_text(850), "8.5%")
+        self.assertEqual(ticket.rate_text(1000), "10%")
+        self.assertEqual(ticket.rate_text(725), "7.25%")
+        self.assertEqual(ticket.rate_text(500), "5%")
+        self.assertEqual(ticket.rate_text(1205), "12.05%")
+        self.assertEqual(ticket.rate_text(0), "0%")
+        self.assertEqual(ticket.tax_of(1010, 500), 51)  # 50.5 rounds up, as on the server
+        self.assertEqual(ticket.tax_of(1200, 850), 102)
+
+    def test_tax_line_shows_the_rate_aligned_with_subtotal_and_total(self):
+        # Miso Soup 3.50 + Toast Tamago 8.50 = 12.00 at 8.5%: Tax (8.5%) 1.02, TOTAL $13.02.
+        order = dict(ORDER, fulfillment="pickup", tableLabel=None, tipCents=0, subtotalCents=1200, taxCents=102, taxRateBps=850, totalCents=1302,
+                     lines=[{"name": {"en": "Miso Soup"}, "quantity": 1, "unitPriceCents": 350, "lineTotalCents": 350, "options": [], "note": ""},
+                            {"name": {"en": "Toast Tamago"}, "quantity": 1, "unitPriceCents": 850, "lineTotalCents": 850, "options": [], "note": ""}])
+        lines = ticket.build(order, RESTAURANT)
+        by_text = {line.text: line for line in lines}
+        self.assertEqual(by_text["Tax (8.5%)"].right, "1.02")
+        self.assertEqual(by_text["Subtotal"].right, "12.00")
+        self.assertEqual(by_text["TOTAL"].right, "$13.02")
+        for paper in (80, 58):
+            for name in ("Subtotal", "Tax (8.5%)", "TOTAL"):
+                rows = ticket.layout(by_text[name], paper)
+                self.assertEqual(len(rows), 1, (paper, name, rows))  # never wraps
+                self.assertEqual(ticket.width(rows[0]), ticket.columns(paper, by_text[name].size))  # amount at the right edge
+            tax_row = ticket.layout(by_text["Tax (8.5%)"], paper)[0]
+            self.assertTrue(tax_row.startswith("Tax (8.5%) ") and tax_row.endswith(" 1.02"))
+        # The picture modes draw it too (same lines).
+        self.assertEqual(render.render(lines, 80).size[0], render.dots_for(80))
+
+    def test_tax_line_without_a_rate(self):
+        # An older server sends no rate: the restaurant's rate when it gives exactly this tax, else just "Tax".
+        labels = lambda order, r: [line.text for line in ticket.build(order, r) if line.text.startswith("Tax")]
+        self.assertEqual(labels(ORDER, dict(RESTAURANT, taxRateBps=500)), ["Tax (5%)"])  # 30.76 x 5% = 1.54
+        self.assertEqual(labels(ORDER, dict(RESTAURANT, taxRateBps=850)), ["Tax"])
+        self.assertEqual(labels(ORDER, RESTAURANT), ["Tax"])
+        self.assertEqual(labels(dict(ORDER, taxRateBps=500), dict(RESTAURANT, taxRateBps=1000)), ["Tax (5%)"])
+
     def test_scheduled_order_and_its_reprint(self):
         order = dict(ORDER, fulfillment="pickup", pickupAt="2026-11-25T18:30:00-08:00", pickupAtLocal="2026-11-25 18:30")
         first = ticket.build(order, RESTAURANT)

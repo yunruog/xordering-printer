@@ -3,6 +3,13 @@ XOrdering 后厨小票打印程序 · Kitchen ticket printer for XOrdering (Wind
 下载 `XOrderingPrinter.exe`，双击运行即可（无需安装其他软件）。安装步骤见 [README](https://github.com/yunruog/xordering-printer#readme)。
 Download `XOrderingPrinter.exe` and double-click it; nothing else to install. Setup steps: see the README.
 
+**0.4.1**
+- 小票的税那一行显示税率：“Tax (8.5%)  1.02”。税率是下单时的税率（后台 设置 → 餐厅 → 销售税），之后改税率不影响已下的单；
+  税率去掉多余的零（8.5%、10%、7.25%），金额和 Subtotal、TOTAL 右对齐。
+  The tax line shows the rate: "Tax (8.5%)  1.02", the rate the order was placed at (Settings → Restaurant → Sales tax),
+  without extra zeros, right-aligned with Subtotal and TOTAL.
+- 测试页的示例订单税额改为和服务器一样四舍五入（0.5 分进位）。The test page's sample tax rounds half up, as the server does.
+
 **0.4.0**
 - 修复“线上订单打成一长串乱码”：原因是打印机类型被保存成了“Star 光栅”，而打印机其实是 ESC/POS，
   Star 光栅指令被当成文字打印（每行开头的 “bH” 就是 Star 光栅的行头）。现在每张小票发出前都会检查：

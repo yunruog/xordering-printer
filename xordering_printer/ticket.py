@@ -11,7 +11,7 @@ one). From the top:
     qty  dish (wrapped)            amount
          @unit price, options, Note: …
     Order note
-    Subtotal / Tax / TOTAL
+    Subtotal / Tax (8.5%) / TOTAL
     NOT PAID · PAY AT PICKUP
 
 A scheduled order's second ticket (20 minutes before pickup) starts with READY BY 6:30 PM · REPRINT.
@@ -51,6 +51,32 @@ def money(cents: Optional[int], currency: str = "CAD") -> str:
     sign = "-" if cents < 0 else ""
     a = abs(cents)
     return f"{sign}{CURRENCY.get(currency, currency + ' ')}{a // 100}.{a % 100:02d}"
+
+
+def tax_of(subtotal_cents: int, rate_bps: int) -> int:
+    """Tax on a subtotal, rounded to the cent half up, as the server's place_order rounds it."""
+    return (int(subtotal_cents) * int(rate_bps) + 5000) // 10000
+
+
+def rate_text(bps: int) -> str:
+    """A tax rate without extra zeros: 850 -> 8.5%, 1000 -> 10%, 725 -> 7.25%."""
+    bps = int(bps)
+    whole, frac = divmod(bps, 100)
+    return f"{whole}{('.' + f'{frac:02d}'.rstrip('0')) if frac else ''}%"
+
+
+def tax_label(order: Dict[str, Any], restaurant: Dict[str, Any]) -> str:
+    """'Tax (8.5%)': the rate the order was taxed at (the server sends it with the order). Older
+    servers don't: then the restaurant's rate when it gives exactly the order's tax, else just 'Tax'."""
+    bps = order.get("taxRateBps")
+    if bps is None:
+        current = restaurant.get("taxRateBps")
+        if current is not None and tax_of(order.get("subtotalCents") or 0, current) == int(order.get("taxCents") or 0):
+            bps = current
+    try:
+        return f"Tax ({rate_text(bps)})" if bps is not None else "Tax"
+    except (TypeError, ValueError):
+        return "Tax"
 
 
 def amount(cents: Optional[int]) -> str:
@@ -236,7 +262,7 @@ def build(order: Dict[str, Any], restaurant: Dict[str, Any], *, reason: str = "n
         lines.append(Line(kind="rule"))
 
     lines.append(Line("Subtotal", right=amount(order.get("subtotalCents"))))
-    lines.append(Line("Tax", right=amount(order.get("taxCents"))))
+    lines.append(Line(tax_label(order, restaurant), right=amount(order.get("taxCents"))))
     if order.get("tipCents"):
         lines.append(Line("Tip", right=amount(order.get("tipCents"))))
     if order.get("deliveryFeeCents"):
@@ -268,7 +294,7 @@ def sample_orders(restaurant: Optional[Dict[str, Any]] = None) -> List[Dict[str,
          "options": [{"group": {"en": "Rice"}, "choice": {"en": "Brown rice"}, "priceDeltaCents": 100}], "note": ""},
     ]
     subtotal = sum(x["lineTotalCents"] for x in lines)
-    tax = round(subtotal * tax_bps / 10000)
+    tax = tax_of(subtotal, tax_bps)
     placed = 15 * 60 + 55
     ready = placed + prep
     base = {
@@ -276,7 +302,7 @@ def sample_orders(restaurant: Optional[Dict[str, Any]] = None) -> List[Dict[str,
         "placedAtLocal": f"{placed // 60:02d}:{placed % 60:02d}", "readyAtLocal": f"{ready // 60 % 24:02d}:{ready % 60:02d}",
         "customer": {"name": "Alan", "phone": "+15095550134"},
         "notes": "少放酱油，谢谢！Please call when ready.", "lines": lines,
-        "subtotalCents": subtotal, "taxCents": tax, "totalCents": subtotal + tax, "paymentStatus": "unpaid",
+        "subtotalCents": subtotal, "taxCents": tax, "taxRateBps": tax_bps, "totalCents": subtotal + tax, "paymentStatus": "unpaid",
     }
     scheduled = dict(base, number=1043, pickupAt="2026-01-01T18:30:00", pickupAtLocal="18:30", customer={"name": "陈小姐", "phone": "+16045550187"})
     return [base, scheduled]
